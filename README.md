@@ -1,2 +1,2 @@
-# VectorQuantization
-Use vector quantization to reduce the size of LLMs
+# VQSmooth
+Combine VQ and Smoothquant to reduce the size of LLM
