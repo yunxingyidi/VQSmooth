@@ -194,6 +194,7 @@ def llama_eval(model, testenc, dev):
 
     for i in range(len(layers)):
         print(i)
+        # layer = layers[i].to(dev)
         layer = layers[i].to(dev)
         for j in range(nsamples):
             outs[j] = layer(

@@ -1,16 +1,17 @@
 import torch
+from openpyxl.styles.builtins import output
 from torch import nn
 from functools import partial
 
-@torch.no_grad()
-def quantize_activation_per_token_absmax(t, n_bits=8):
-    t_shape = t.shape
-    t.view(-1, t_shape[-1])
-    scales = t.abs().max(dim=-1, keepdim=True)[0]
-    q_max = 2 ** (n_bits - 1) - 1
-    scales.clamp_(min=1e-5).div_(q_max)
-    t.div_(scales).round_().mul_(scales)
-    return t
+# @torch.no_grad()
+# def quantize_activation_per_token_absmax(t, n_bits=8):
+#     t_shape = t.shape
+#     t.view(-1, t_shape[-1])
+#     scales = t.abs().max(dim=-1, keepdim=True)[0]
+#     q_max = 2 ** (n_bits - 1) - 1
+#     scales.clamp_(min=1e-5).div_(q_max)
+#     t.div_(scales).round_().mul_(scales)
+#     return t
 
 @torch.no_grad()
 def quantize_activation_per_tensor_absmax(t, n_bits=8, residual_group=32):
@@ -22,35 +23,90 @@ def quantize_activation_per_tensor_absmax(t, n_bits=8, residual_group=32):
     t.div_(scales).round_().mul_(scales)
     return t
 
-# @torch.no_grad()
-# def quantize_activation_per_token_absmax(t, n_bits=8, residual_group=32):
-    # orig_shape = t.shape
-    # H = orig_shape[-1]
-    # assert H % residual_group == 0
-    # G = H // residual_group
-    # q_max = 2 ** (n_bits - 1) - 1
-    #
-    # t_hat = torch.empty_like(t)
-    #
-    # for i in range(G):
-    #     start = i * residual_group
-    #     end = (i + 1) * residual_group
-    #     cluster = t[..., start:end]  # [..., residual_group]
-    #
-    #     # Step 2: cluster-wise scale
-    #     delta_i = cluster.abs().amax(dim=-1, keepdim=True) / q_max
-    #
-    #     # Step 3: base scale
-    #     delta_base = delta_i.max(dim=-2, keepdim=True).values
-    #
-    #     # Step 4: residual step
-    #     R = (delta_i - delta_base).abs().mean(dim=-2, keepdim=True)
-    #
-    #     # Step 5: 量化 + 残差补偿
-    #     t_q = (cluster / delta_base).round() * delta_base
-    #     t_hat[..., start:end] = t_q + R  # 不再 expand_as 整个 t
-    #
-    # return t_hat
+@torch.no_grad()
+def quantize_activation_per_token_absmax(
+    t: torch.Tensor,
+    n_bits: int = 8,
+    residual_group: int = 32,
+    residual_bits: int = 4,
+    R_min_ratio: float = 0.0,
+    R_max_ratio: float = 1.0,
+    R_steps: int = 64,
+):
+    """
+    Per-token quantization with group-wise scale residual approximation
+
+    Args:
+        t: [B, T, H] activation
+        n_bits: activation quant bits
+        residual_group: group size along H
+        residual_bits: E, bits for residual code e
+        R_min_ratio, R_max_ratio: search range relative to delta_base
+        R_steps: number of R candidates
+
+    Returns:
+        t_dq: dequantized activation after scale residual approximation
+    """
+    B, T, H = t.shape
+    assert H % residual_group == 0
+    G = H // residual_group
+
+    q_max = 2 ** (n_bits - 1) - 1
+
+    # ===== Step 0: preserve fp activation =====
+    t_fp = t.clone()
+
+    # ===== Step 1: per-(token, group) true scale Δ_i =====
+    t_group = t_fp.view(B, T, G, residual_group)
+    delta = t_group.abs().max(dim=-1)[0].clamp_(min=1e-5) / q_max          # [B, T, G]
+
+    # ===== Step 2: base scale Δ_base (per token) =====
+    delta_base = delta.max(dim=-1, keepdim=True)[0]       # [B, T, 1]
+
+    # ===== Step 3: initialize residual step R_init =====
+    R_init = (delta_base - delta).abs().mean(dim=-1, keepdim=True)
+    R_init = R_init / max(residual_bits, 1)
+    R_init = torch.clamp(R_init, min=1e-8)                # [B, T, 1]
+
+    # ===== Step 4: residual code e_i =====
+    e = torch.floor((delta - delta_base) / R_init)        # [B, T, G]
+    e_min = -(2 ** (residual_bits - 1) - 1)
+    e = torch.clamp(e, e_min, 0)
+
+    # ===== Step 5: search optimal R (per token) =====
+    R_candidates = torch.linspace(
+        R_min_ratio, R_max_ratio, R_steps, device=t.device
+    ).view(1, 1, -1) * delta_base                          # [B,T,R]
+
+    best_R = torch.zeros_like(delta_base)
+    best_loss = None
+
+    for k in range(R_candidates.shape[-1]):
+        Rk = R_candidates[..., k:k+1]                     # [B,T,1]
+        delta_hat = delta_base + e * Rk                    # [B,T,G]
+        loss = ((delta - delta_hat) ** 2).mean(dim=-1)    # [B,T]
+
+        if best_loss is None:
+            best_loss = loss
+            best_R = Rk
+        else:
+            mask = loss < best_loss
+            best_loss = torch.where(mask, loss, best_loss)
+            best_R = torch.where(mask.unsqueeze(-1), Rk, best_R)
+
+    # ===== Step 6: reconstructed group scale =====
+    delta_rec = delta_base + e * best_R                    # [B,T,G]
+    delta_rec = torch.clamp(delta_rec, min=1e-5)
+
+    # ===== Step 7: quantize & dequantize with reconstructed scale =====
+    scale_rec = delta_rec.unsqueeze(-1)                    # [B,T,G,1]
+    t_q = torch.round(t_group / scale_rec) * scale_rec
+
+    t_dq = t_q.view(B, T, H).to(t.dtype)
+    # diff = t_dq - t
+    # print("mean abs diff:", diff.abs().mean().item())
+    # print("max  abs diff:", diff.abs().max().item())
+    return t_dq
 
 
 class GroupQLinear(nn.Module):
@@ -99,7 +155,7 @@ class GroupQLinear(nn.Module):
             self.output_quant = self.act_quant
         else:
             self.output_quant_name = "None"
-            self.output_quant = lambda x: x
+            self.output_quant = nn.Identity()
 
     def to(self, *args, **kwargs):
         super(GroupQLinear, self).to(*args, **kwargs)

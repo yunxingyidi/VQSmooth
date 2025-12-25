@@ -93,8 +93,8 @@ else:
             act_quant="per_token",
             quantize_bmm_input=True,
         )
-    # if args.codebook_width < 16:
-    #     quantizers = llama_sequential(model, dataloader, DEV, args)
+    if args.codebook_width < 16:
+        quantizers = llama_sequential(model, dataloader, DEV, args)
 
     if args.save_model:
         torch.save(model, "quantized_model.pt")
