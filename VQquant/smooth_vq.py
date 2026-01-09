@@ -81,17 +81,18 @@ class SmoothVQ:
         self.quantizer.get_centroids(W, weight=True)
 
         sub_vector = 1
+
         if use_vq:
             sub_vector = self.quantizer.sub_vector
             self.assignments = []
 
-        Q = torch.zeros_like(W)
         Q, assmt = vq_quantize(W, self.quantizer)
         if use_vq:
             self.assignments.append(assmt)
         # reshape back
         if isinstance(self.layer, transformers.Conv1D):
             Q = Q.t()
+
         # optional M-step
         # if include_m_step:
         #     Q = self.lut_m_step(Q, self.quantizer)

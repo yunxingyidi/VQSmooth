@@ -1,13 +1,8 @@
 from urllib.parse import uses_query
 
-import torch
-import torch.nn as nn
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from Smoothquant.smooth import smooth_lm
 from Smoothquant.group_quant import quantize_model
-import tqdm
-
-from datasets import load_dataset, load_from_disk
 import argparse
 import sys
 sys.path.append(".")
@@ -93,11 +88,14 @@ else:
             act_quant="per_token",
             quantize_bmm_input=True,
         )
-    if args.codebook_width < 16:
-        quantizers = llama_sequential(model, dataloader, DEV, args)
+    # if args.codebook_width < 16:
+    #     quantizers = llama_sequential(model, dataloader, DEV, args)
 
     if args.save_model:
-        torch.save(model, "quantized_model.pt")
+        torch.save(
+            model.state_dict(),
+            "quant_llama_state.pt"
+        )
 
 llama_eval(model, testloader, DEV)
 
