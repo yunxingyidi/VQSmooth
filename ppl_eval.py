@@ -10,8 +10,6 @@ from VQquant.llama import get_llama, llama_eval, llama_sequential
 from VQquant.datautils import get_loaders
 from VQquant.modelutils import *
 
-
-
 parser = argparse.ArgumentParser()
 parser.add_argument("--alpha", type=float, default=0.5)
 parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-hf")
@@ -25,6 +23,7 @@ parser.add_argument("--smooth", action="store_true")
 parser.add_argument("--group-quantize", action="store_true")
 parser.add_argument("--save-model", action="store_true")
 parser.add_argument("--eval-only", action="store_true")
+parser.add_argument("--fake-quant", action="store_true")
 parser.add_argument(
         "--seed", type=int, default=0, help="Seed for sampling the calibration data."
     )
@@ -54,8 +53,38 @@ parser.add_argument(
         choices=["wikitext2", "ptb", "c4"],
         help="Where to extract calibration data from.",
     )
+parser.add_argument(
+    "--ckpt",
+    type=str,
+    default="vq_ckpt.pt",
+    help="Path to GroupQLinear checkpoint",
+)
 
 args = parser.parse_args()
+
+def load_groupql_checkpoint(model, ckpt_path):
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+
+    state_dict = ckpt["model"] if "model" in ckpt else ckpt
+
+    missing, unexpected = model.load_state_dict(
+        state_dict,
+        strict=True,
+    )
+
+    print("[GroupQLinear] checkpoint loaded")
+
+def build_ckpt_name(args):
+    if args.use_vq:
+        parts = ["vq"]
+    else:
+        parts = []
+
+    parts.append("smooth" if args.smooth else "nosmooth")
+    parts.append(f"cb{args.codebook_width}")
+    parts.append(f"sv{args.sub_vector}")
+
+    return "_".join(parts) + ".pt"
 
 model = AutoModelForCausalLM.from_pretrained(
     args.model, torch_dtype=torch.bfloat16, device_map="auto"
@@ -67,36 +96,34 @@ dataloader, testloader = get_loaders(
     )
 
 if args.eval_only:
-    state_dict = torch.load(
-        "/home/zhangtr/WorkSpace/models/quantized_model_state_dict.pt",
-        map_location="cpu"
-    )
-    model.load_state_dict(state_dict)
     model = model.cuda()
     model = quantize_model(
         model,
-        act_quant="per_token",
-        quantize_bmm_input=True,
+        args
     )
+    load_groupql_checkpoint(model, args.ckpt)
+    print("Llama eval")
+    llama_eval(model, testloader, DEV)
 else:
     if args.smooth:
+        print("Smooth quantize...")
         act_scales = torch.load(args.act_scales_path)
         smooth_lm(model, act_scales, args.alpha)
     if args.group_quantize:
+        # if args.codebook_width < 16:
+        #     quantizers = llama_sequential(model, dataloader, DEV, args)
+        print("Vector quantize...")
         model = quantize_model(
             model,
-            act_quant="per_token",
-            quantize_bmm_input=True,
+            args
         )
-    # if args.codebook_width < 16:
-    #     quantizers = llama_sequential(model, dataloader, DEV, args)
-
     if args.save_model:
-        torch.save(
-            model.state_dict(),
-            "quant_llama_state.pt"
-        )
-
+        print("Saving model...")
+        ckpt_name = build_ckpt_name(args)
+        checkpoint = {
+            "model": model.state_dict(),
+            "config": model.config,  # 如果你是 HF LLaMA
+        }
+        torch.save(checkpoint, ckpt_name)
 llama_eval(model, testloader, DEV)
-
 

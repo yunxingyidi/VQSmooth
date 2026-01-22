@@ -2,7 +2,6 @@ import numpy as np
 import torch
 from torch import nn
 import time
-from uniform_quantizers import SymmetricUniformQuantizer
 
 def get_assignments(X, centroids, chunk_size=None):
     """
@@ -24,29 +23,30 @@ def get_assignments(X, centroids, chunk_size=None):
         dist = ((X_chunk.unsqueeze(2) - cent_chunk.unsqueeze(1)) ** 2).sum(-1)  # [N_chunk, R, K]
         assignments_chunks.append(dist.argmin(-1))  # [N_chunk, R]
 
-    assignments = torch.cat(assignments_chunks, dim=0)  # G x N
+    assignments = torch.cat(assignments_chunks, dim=0)
     return assignments
 
-
-def vq_quantize(X, quantizer, centroids=None):
+def vq_quantize(X, quantizer, centroids=None, fake_quant=False):
     assert len(X.shape) == 2
     R, C = X.shape
 
     sub_vector = quantizer.sub_vector
-
     X = X.reshape(R, -1, sub_vector)  # R x C//D x D
     X = X.permute(1, 0, 2)
     if centroids is None:
         centroids = quantizer.all_centroids[-1]  # N x K x D
+
     idx = get_assignments(
         X, centroids, chunk_size=quantizer.assignment_chunk_size
     )  # N x R
     # below, idx expanded to N x K x D
-    values = torch.gather(centroids, dim=1, index=idx.unsqueeze(-1).expand(-1, -1, sub_vector))
-
-    # return shapes: N x R x D, G x N
-    values = values.permute(1, 0, 2)
-    return values.reshape(R, C), idx
+    if fake_quant:
+        values = torch.gather(centroids, dim=1, index=idx.unsqueeze(-1).expand(-1, -1, sub_vector))
+        values = values.permute(1, 0, 2)
+        return values.reshape(R, C), idx
+        # return shapes: N x R x D, G x N
+    else:
+        return idx
 
 def kmeans_m_step_3(
     centroids: torch.Tensor,
@@ -89,7 +89,6 @@ def kmeans_m_step_3(
     norm = 1.0 / torch.clamp(counts, min=1.0)
     centroids.copy_(clusters_sum * norm.unsqueeze(-1))
 
-
 def kmeans_vq(
     X,
     centroids,
@@ -107,9 +106,7 @@ def kmeans_vq(
         # Centroids is shape N x K x D; assignments is shape G x N
         kmeans_m_step_3(centroids, n_centroids, assignments, X)
 
-
 def kpp_parallel_sampled(data: torch.Tensor, k: int):
-
     N, R, D = data.shape
     all_init = []
 

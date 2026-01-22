@@ -12,6 +12,13 @@ void quant_cuda_launcher(
     int residual_bits
 );
 
+void dequant_cuda_launcher(
+    torch::Tensor t_q,
+    torch::Tensor delta_base,
+    torch::Tensor e,
+    torch::Tensor t_fp,
+    int residual_bits
+);
 
 void quant_forward(
     torch::Tensor t_fp,
@@ -26,6 +33,19 @@ void quant_forward(
     );
 }
 
-PYBIND11_MODULE(quant_cuda, m) {
-    m.def("forward", &quant_forward, "Quantize CUDA");
+void dequant_forward(
+    torch::Tensor t_q,
+    torch::Tensor delta_base,
+    torch::Tensor e,
+    torch::Tensor t_fp,
+    int residual_bits
+) {
+    dequant_cuda_launcher(
+        t_q, delta_base, e, t_fp, residual_bits
+    );
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("quant_forward", &quant_forward, "Quantize CUDA");
+    m.def("dequant_forward", &dequant_forward, "Dequantize CUDA");
 }

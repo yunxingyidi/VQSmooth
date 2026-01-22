@@ -1,11 +1,15 @@
 from distutils.core import setup_keywords
 
 import torch
+from numpy import dtype
 from openpyxl.styles.builtins import output
 from torch import nn
 from functools import partial
 import GroupQuant
 from dataclasses import dataclass
+import VectorQuant
+from VQquant.smooth_vq import SmoothVQ
+from VQquant.vector_quant import VectorQuantizer
 
 # @torch.no_grad()
 # def quantize_activation_per_token_absmax(t, n_bits=8):
@@ -167,21 +171,35 @@ class GroupQLinear(nn.Module):
         self,
         in_features,
         out_features,
+        n_groups,
+        codebook_width,
         bias=True,
         fake_quant=False,
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.n_groups = n_groups
+        self.weight = None
+        self.codebook_width = codebook_width
 
         self.fake_quant = fake_quant
 
         self.register_buffer(
-            "weight",
-            torch.randn(
+            "weight_indices",
+            torch.zeros(
+                self.n_groups,
                 self.out_features,
+                dtype=torch.uint8,
+                requires_grad=False,
+            ),
+        )
+        self.register_buffer(
+            "weight_codebook",
+            torch.randn(
+                2 ** self.codebook_width,
                 self.in_features,
-                dtype=torch.float16,
+                dtype=torch.bfloat16,
                 requires_grad=False,
             ),
         )
@@ -189,7 +207,7 @@ class GroupQLinear(nn.Module):
             self.register_buffer(
                 "bias",
                 torch.zeros(
-                    (1, self.out_features), dtype=torch.float16, requires_grad=False
+                    (1, self.out_features), dtype=torch.bfloat16, requires_grad=False
                 ),
             )
         else:
@@ -197,16 +215,18 @@ class GroupQLinear(nn.Module):
 
     def to(self, *args, **kwargs):
         super(GroupQLinear, self).to(*args, **kwargs)
-        self.weight = self.weight.to(*args, **kwargs)
-        if self.bias is not None:
-            self.bias = self.bias.to(*args, **kwargs)
+        # self.weight = self.weight.to(*args, **kwargs)
+        # if self.bias is not None:
+        #     self.bias = self.bias.to(*args, **kwargs)
         return self
 
     @torch.no_grad()
     def forward(self, x):
         if not self.fake_quant:
             dq_x = x.dequantize()
-            y = torch.functional.F.linear(dq_x, self.weight, self.bias)
+            weight = torch.zeros((self.in_features, self.out_features), dtype=torch.bfloat16, device='cuda')
+            VectorQuant.dequant_forward(self.weight_indices.to(dtype=torch.uint8), self.weight_codebook.to(dtype=torch.bfloat16).t().contiguous(), weight, int(self.out_features / 1024 + 1))
+            y = torch.functional.F.linear(dq_x, weight.t(), self.bias)
             q_y = QuantTensor(y)
             return q_y
         else:
@@ -217,16 +237,32 @@ class GroupQLinear(nn.Module):
 
     @staticmethod
     def from_float(
-        module, fake_quant
+        module, args, QClass
     ):
         assert isinstance(module, torch.nn.Linear)
+        n_groups = int(module.in_features / args.sub_vector)
         new_module = GroupQLinear(
-            module.in_features,
-            module.out_features,
-            module.bias is not None,
-            fake_quant,
+            in_features=module.in_features,
+            out_features=module.out_features,
+            n_groups= n_groups,
+            bias=module.bias is not None,
+            fake_quant=args.fake_quant,
+            codebook_width=args.codebook_width
         )
-        new_module.weight = module.weight
+        if not args.eval_only:
+            smoothvq = SmoothVQ(module)
+            smoothvq.quantizer = QClass()
+            smoothvq.quantizer.configure(codebook_width=args.codebook_width)
+            if args.fake_quant:
+                new_module.weight = smoothvq.fasterquant(fake_quant=args.fake_quant)
+            else:
+                indices, codebook = smoothvq.fasterquant(fake_quant=args.fake_quant)
+                new_module.weight_indices = indices
+                new_module.weight_codebook = codebook
+            smoothvq.free()
+        # else:
+        #     new_module.weight_indices = module.indices
+        #     new_module.weight_codebook = module.codebook
 
         if module.bias is not None:
             new_module.bias = module.bias
@@ -237,7 +273,8 @@ class GroupQLinear(nn.Module):
 
 
 def quantize_llama_like(
-    model
+    model,
+    args
 ):
     from transformers.models.llama.modeling_llama import (
         LlamaAttention,
@@ -258,15 +295,26 @@ def quantize_llama_like(
         parent_name = name.rsplit(".", 1)[0]
         child_name = name.split(".")[-1]
         parent = model.model.get_submodule(parent_name)
-        if isinstance(m, (LlamaMLP, MistralMLP)):
-            setattr(parent, child_name, QuantLlamaMLP(m, m.config, False))
-        elif isinstance(m, (LlamaAttention, MistralAttention)):
-            setattr(parent, child_name, QuantLlamaAttention(m, m.config, layer_idx=layer_counter))
+        QClass = lambda: VectorQuantizer(
+            sub_vector=args.sub_vector,
+            assignment_chunk_size=args.assignment_chunk_size,
+            kmeans_iters=args.kmeans_iters,
+            codebook_width=args.codebook_width,
+        )
+
+        if isinstance(m, (LlamaMLP, MistralMLP)) and layer_counter == 0:
+            print(parent_name, child_name)
+            setattr(parent, child_name, QuantLlamaMLP(m, m.config, args, QClass=QClass))
             layer_counter += 1
+        # if isinstance(m, (LlamaAttention, MistralAttention)):
+        #     print(parent_name, child_name)
+        #     setattr(parent, child_name, QuantLlamaAttention(m, m.config, layer_idx=layer_counter, args=args, QClass=QClass))
+        #     layer_counter += 1
     return model
 
 def quantize_model(
-    model, act_quant="per_token", quantize_bmm_input=False
+    model,
+    args
 ):
     from transformers.models.llama.modeling_llama import LlamaPreTrainedModel
     from transformers.models.mistral.modeling_mistral import MistralPreTrainedModel
@@ -274,6 +322,7 @@ def quantize_model(
     if isinstance(model, (LlamaPreTrainedModel, MistralPreTrainedModel)):
         return quantize_llama_like(
             model,
+            args
         )
     else:
         raise ValueError(f"Unsupported model type: {type(model)}")

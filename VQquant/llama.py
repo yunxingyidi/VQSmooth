@@ -108,8 +108,7 @@ def llama_sequential(model, dataloader, dev, args):
             def add_batch(name):
                 def tmp(_, inp, out):
                     smoothvq[name].add_batch(inp[0].detach().clone(),
-            out.detach().clone())
-
+                out.detach().clone())
                 return tmp
 
             handles = []
