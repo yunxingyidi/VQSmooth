@@ -16,8 +16,8 @@ def set_seed(seed):
 def get_wikitext2(nsamples, seed, seqlen, model):
     from datasets import load_dataset
 
-    traindata = load_from_disk("/home/zhangtr/WorkSpace/datasets/wikitext-2-raw-v1/train", "default")
-    testdata = load_from_disk("/home/zhangtr/WorkSpace/datasets/wikitext-2-raw-v1/test", "default")
+    traindata = load_from_disk("/root/autodl-tmp/datasets/wikitext-2-raw-v1/train", "default")
+    testdata = load_from_disk("/root/autodl-tmp/datasets/wikitext-2-raw-v1/test", "default")
 
     from transformers import AutoTokenizer
 
