@@ -9,6 +9,7 @@ sys.path.append(".")
 from VQquant.llama import get_llama, llama_eval, llama_sequential
 from VQquant.datautils import get_loaders
 from VQquant.modelutils import *
+import torch
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--alpha", type=float, default=0.5)
@@ -59,8 +60,21 @@ parser.add_argument(
     default="vq_ckpt.pt",
     help="Path to GroupQLinear checkpoint",
 )
+parser.add_argument(
+    "--device",
+    type=str,
+    default="cuda:0",
+    help="Single device used for llama_eval.",
+)
+parser.add_argument(
+    "--quant-device-map",
+    type=str,
+    default="auto",
+    help="Device map used during smooth/VQ stage. Use 'none' for single-device loading.",
+)
 
 args = parser.parse_args()
+eval_device = torch.device(args.device)
 
 def load_groupql_checkpoint(model, ckpt_path):
     ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -86,24 +100,50 @@ def build_ckpt_name(args):
 
     return "_".join(parts) + ".pt"
 
-model = AutoModelForCausalLM.from_pretrained(
-    args.model, torch_dtype=torch.bfloat16, device_map="auto"
-)
-model = get_llama(model)
-model.eval()
+def build_model_for_quant_stage(args):
+    load_kwargs = {"torch_dtype": torch.bfloat16}
+    if args.quant_device_map and args.quant_device_map.lower() != "none":
+        load_kwargs["device_map"] = args.quant_device_map
+    model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
+    model = get_llama(model)
+    model.eval()
+    return model
+
+
+def move_to_single_eval_device(model, args):
+    is_quantized = args.group_quantize or args.eval_only
+    print(f"Rebuild model on {args.device} for llama_eval...")
+    cpu_state = {k: v.detach().to("cpu") for k, v in model.state_dict().items()}
+    del model
+    torch.cuda.empty_cache()
+
+    eval_model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        torch_dtype=torch.bfloat16,
+    )
+    eval_model = get_llama(eval_model)
+    if is_quantized:
+        eval_args = argparse.Namespace(**vars(args))
+        eval_args.eval_only = True
+        eval_model = quantize_model(eval_model, eval_args)
+
+    eval_model.load_state_dict(cpu_state, strict=True)
+    eval_model = eval_model.to(args.device)
+    eval_model.eval()
+    return eval_model
+
+
+model = build_model_for_quant_stage(args)
 dataloader, testloader = get_loaders(
         args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
     )
 
 if args.eval_only:
-    model = model.cuda()
     model = quantize_model(
         model,
         args
     )
     load_groupql_checkpoint(model, args.ckpt)
-    print("Llama eval")
-    llama_eval(model, testloader, DEV)
 else:
     if args.smooth:
         print("Smooth quantize...")
@@ -125,5 +165,6 @@ else:
             "config": model.config,  # 如果你是 HF LLaMA
         }
         torch.save(checkpoint, ckpt_name)
-llama_eval(model, testloader, DEV)
 
+model = move_to_single_eval_device(model, args)
+llama_eval(model, testloader, eval_device)

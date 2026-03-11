@@ -7,3 +7,16 @@
 /Smoothquant/GroupQuant/dist
 /Smoothquant/GroupQuant/GroupQuant.egg-info
 /datasets
+/act_scales/llama-2-7b.pt
+vq_ckpt.pt
+vq_nosmooth_cb8_sv2.pt
+/.idea
+/__pycache__
+/Smoothquant/__pycache__
+/act_scales/__pycache__
+/VQquant/__pycache__
+/VQquant/VectorQuant/build
+/VQquant/VectorQuant/dist
+/VQquant/VectorQuant/VectorQuant.egg-info
+/.vscode
+/VQquant/cuda_test.py

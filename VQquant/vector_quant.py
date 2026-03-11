@@ -37,8 +37,10 @@ def vq_quantize(X, quantizer, centroids=None, fake_quant=False):
         centroids = quantizer.all_centroids[-1]  # N x K x D
 
     idx = get_assignments(
-        X, centroids, chunk_size=quantizer.assignment_chunk_size
-    )  # N x R
+        X,
+        centroids,
+        chunk_size=quantizer.assignment_chunk_size,
+    )
     # below, idx expanded to N x K x D
     if fake_quant:
         values = torch.gather(centroids, dim=1, index=idx.unsqueeze(-1).expand(-1, -1, sub_vector))
@@ -99,7 +101,9 @@ def kmeans_vq(
     for iter in range(iters):
         # E-step
         assignments = get_assignments(
-            X, centroids, chunk_size=assignment_chunk_size
+            X,
+            centroids,
+            chunk_size=assignment_chunk_size,
         )
 
         # M-step: gather all values for each centroid and compute means
@@ -151,7 +155,7 @@ class VectorQuantizer(nn.Module):
         n_subsample=100000,
         assignment_chunk_size=None,
         kmeans_iters=10,
-        codebook_width=None
+        codebook_width=None,
     ):
         super().__init__()
         self.sub_vector = sub_vector

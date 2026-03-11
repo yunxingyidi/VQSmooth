@@ -302,14 +302,13 @@ def quantize_llama_like(
             codebook_width=args.codebook_width,
         )
 
-        if isinstance(m, (LlamaMLP, MistralMLP)) and layer_counter == 0:
+        if isinstance(m, (LlamaMLP, MistralMLP)):
             print(parent_name, child_name)
             setattr(parent, child_name, QuantLlamaMLP(m, m.config, args, QClass=QClass))
+        if isinstance(m, (LlamaAttention, MistralAttention)):
+            print(parent_name, child_name)
+            setattr(parent, child_name, QuantLlamaAttention(m, m.config, layer_idx=layer_counter, args=args, QClass=QClass))
             layer_counter += 1
-        # if isinstance(m, (LlamaAttention, MistralAttention)):
-        #     print(parent_name, child_name)
-        #     setattr(parent, child_name, QuantLlamaAttention(m, m.config, layer_idx=layer_counter, args=args, QClass=QClass))
-        #     layer_counter += 1
     return model
 
 def quantize_model(
