@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch_npu
 from torch import nn
 import time
 

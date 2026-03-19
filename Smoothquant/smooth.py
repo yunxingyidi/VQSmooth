@@ -1,4 +1,5 @@
 import torch
+import torch_npu
 import torch.nn as nn
 
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaRMSNorm

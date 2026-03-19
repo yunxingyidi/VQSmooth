@@ -2,6 +2,7 @@ import sys, os
 sys.path.append(os.path.dirname(__file__))
 import math
 import torch
+import torch_npu
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn

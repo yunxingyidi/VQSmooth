@@ -1,4 +1,5 @@
 import torch
+import torch_npu
 import torch.nn as nn
 
 from datasets import load_dataset

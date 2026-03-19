@@ -8,3 +8,10 @@
 /Smoothquant/GroupQuant/GroupQuant.egg-info
 /datasets
 /Smoothquant/__pycache__
+/act_scales/__pycache__
+/.vscode
+/act_scales/llama-2-7b.pt
+/Smoothquant/GroupQuant/__pycache__
+/Smoothquant/GroupQuant/test_group_quant_algorithm.py
+/VQquant/__pycache__
+__pycache__/

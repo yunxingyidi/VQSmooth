@@ -1,5 +1,11 @@
 from urllib.parse import uses_query
 
+import torch
+try:
+    import torch_npu  # noqa: F401
+except ImportError:
+    torch_npu = None
+
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from Smoothquant.smooth import smooth_lm
 from Smoothquant.group_quant import quantize_model
@@ -59,8 +65,38 @@ parser.add_argument(
     default="vq_ckpt.pt",
     help="Path to GroupQLinear checkpoint",
 )
+parser.add_argument(
+    "--device",
+    type=str,
+    default="auto",
+    choices=["auto", "npu", "cuda", "cpu"],
+    help="device to run evaluation on",
+)
 
 args = parser.parse_args()
+
+
+def resolve_device(device):
+    if device == "auto":
+        if torch_npu is not None and hasattr(torch, "npu") and torch.npu.is_available():
+            return torch.device("npu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("cpu")
+
+    if device == "npu":
+        if torch_npu is None or not hasattr(torch, "npu") or not torch.npu.is_available():
+            raise RuntimeError(
+                "Requested NPU, but torch_npu is not installed or no NPU is available."
+            )
+        return torch.device("npu")
+
+    return torch.device(device)
+
+
+device = resolve_device(args.device)
+DEV = device
+print(f"Using device: {device}")
 
 def load_groupql_checkpoint(model, ckpt_path):
     ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -87,8 +123,8 @@ def build_ckpt_name(args):
     return "_".join(parts) + ".pt"
 
 model = AutoModelForCausalLM.from_pretrained(
-    args.model, torch_dtype=torch.bfloat16, device_map="auto"
-)
+    args.model, torch_dtype=torch.bfloat16
+).to(device)
 model = get_llama(model)
 model.eval()
 dataloader, testloader = get_loaders(
@@ -96,7 +132,6 @@ dataloader, testloader = get_loaders(
     )
 
 if args.eval_only:
-    model = model.cuda()
     model = quantize_model(
         model,
         args
@@ -126,4 +161,3 @@ else:
         }
         torch.save(checkpoint, ckpt_name)
 llama_eval(model, testloader, DEV)
-

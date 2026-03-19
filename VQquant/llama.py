@@ -3,6 +3,7 @@ sys.path.append(os.path.dirname(__file__))
 import time
 
 import torch
+import torch_npu
 import torch.nn as nn
 
 import transformers

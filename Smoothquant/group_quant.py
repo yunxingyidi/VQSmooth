@@ -1,15 +1,22 @@
-from distutils.core import setup_keywords
-
+import sys, os
+sys.path.append(os.path.dirname(__file__))
 import torch
-from numpy import dtype
-from openpyxl.styles.builtins import output
+import torch_npu
 from torch import nn
-from functools import partial
-import GroupQuant
 from dataclasses import dataclass
-import VectorQuant
+from Smoothquant.GroupQuant.group_quant_algorithm import (
+    fake_quantize_activation_per_token,
+    group_dequantize,
+    group_quantize,
+    group_quantize_dequantize,
+)
 from VQquant.smooth_vq import SmoothVQ
 from VQquant.vector_quant import VectorQuantizer
+
+try:
+    import VectorQuant
+except ModuleNotFoundError:
+    VectorQuant = None
 
 # @torch.no_grad()
 # def quantize_activation_per_token_absmax(t, n_bits=8):
@@ -95,32 +102,13 @@ def quantize_activation_per_token_absmax(
     residual_group: int = 32,
     residual_bits: int = 4,
 ):
-    B, T, H = t.shape
-    assert H % residual_group == 0
-    G = H // residual_group
-
-    t_q_cuda = torch.empty_like(t, dtype=torch.int8, device="cuda")
-    t_fp_rec = torch.empty_like(t, dtype=torch.bfloat16, device="cuda")
-    delta_base_cuda = torch.empty(B, T, device="cuda", dtype=torch.bfloat16)
-    e_cuda = torch.empty(B, T, G, device="cuda", dtype=torch.int8)
-
-    GroupQuant.quant_forward(
+    return group_quantize_dequantize(
         t,
-        t_q_cuda,
-        delta_base_cuda,
-        e_cuda,
-        n_bits,
-        residual_bits
+        n_bits=n_bits,
+        residual_group=residual_group,
+        residual_bits=residual_bits,
+        output_dtype=torch.bfloat16,
     )
-
-    GroupQuant.dequant_forward(
-        t_q_cuda,
-        delta_base_cuda,
-        e_cuda,
-        t_fp_rec,
-        residual_bits
-    )
-    return t_fp_rec
 
 @dataclass
 class QuantTensor:
@@ -133,38 +121,40 @@ class QuantTensor:
         B, T, H = x.shape
         assert H % residual_group == 0
         G = H // residual_group
+        device = x.device
 
         self.activation = torch.empty_like(
-            x, device="cuda", dtype=torch.int8
+            x, device=device, dtype=torch.int8
         )
         self.delta_base = torch.empty(
-            B, T, device="cuda", dtype=torch.bfloat16
+            B, T, device=device, dtype=torch.bfloat16
         )
         self.e = torch.empty(
-            B, T, G, device="cuda", dtype=torch.int8
+            B, T, G, device=device, dtype=torch.int8
         )
+        self.residual_group = residual_group
         self.quantize(x)
 
     def quantize(self, x, n_bits=8, residual_bits=4):
-        GroupQuant.quant_forward(
+        qt = group_quantize(
             x,
-            self.activation,
-            self.delta_base,
-            self.e,
-            n_bits,
-            residual_bits
+            n_bits=n_bits,
+            residual_group=self.residual_group,
+            residual_bits=residual_bits,
         )
-    def dequantize(self, residual_bits=4):
-        t_fp_rec = torch.empty_like(self.activation, dtype=torch.bfloat16, device="cuda")
+        self.activation.copy_(qt.activation)
+        self.delta_base.copy_(qt.delta_base)
+        self.e.copy_(qt.e)
 
-        GroupQuant.dequant_forward(
+    def dequantize(self, residual_bits=4):
+        return group_dequantize(
             self.activation,
             self.delta_base,
             self.e,
-            t_fp_rec,
-            residual_bits
+            residual_group=self.residual_group,
+            residual_bits=residual_bits,
+            output_dtype=torch.bfloat16,
         )
-        return t_fp_rec
 
 class GroupQLinear(nn.Module):
     def __init__(
@@ -224,15 +214,32 @@ class GroupQLinear(nn.Module):
     def forward(self, x):
         if not self.fake_quant:
             dq_x = x.dequantize()
-            weight = torch.zeros((self.in_features, self.out_features), dtype=torch.bfloat16, device='cuda')
-            VectorQuant.dequant_forward(self.weight_indices.to(dtype=torch.uint8), self.weight_codebook.to(dtype=torch.bfloat16).t().contiguous(), weight, int(self.out_features / 1024 + 1))
+            if self.weight is not None:
+                weight = self.weight
+            else:
+                if VectorQuant is None:
+                    raise ModuleNotFoundError(
+                        "VectorQuant extension is not available. "
+                        "Build/install the VectorQuant extension or disable VQ weight quantization."
+                    )
+                weight = torch.zeros(
+                    (self.in_features, self.out_features),
+                    dtype=torch.bfloat16,
+                    device=dq_x.device,
+                )
+                VectorQuant.dequant_forward(
+                    self.weight_indices.to(dtype=torch.uint8),
+                    self.weight_codebook.to(dtype=torch.bfloat16).t().contiguous(),
+                    weight,
+                    int(self.out_features / 1024 + 1),
+                )
             y = torch.functional.F.linear(dq_x, weight.t(), self.bias)
             q_y = QuantTensor(y)
             return q_y
         else:
-            d_x = quantize_activation_per_token_absmax(x, n_bits=8)
+            d_x = fake_quantize_activation_per_token(x)
             y = torch.functional.F.linear(d_x, self.weight, self.bias)
-            y = quantize_activation_per_token_absmax(y, n_bits=8)
+            y = fake_quantize_activation_per_token(y)
             return y
 
     @staticmethod
@@ -253,12 +260,15 @@ class GroupQLinear(nn.Module):
             smoothvq = SmoothVQ(module)
             smoothvq.quantizer = QClass()
             smoothvq.quantizer.configure(codebook_width=args.codebook_width)
-            if args.fake_quant:
-                new_module.weight = smoothvq.fasterquant(fake_quant=args.fake_quant)
-            else:
-                indices, codebook = smoothvq.fasterquant(fake_quant=args.fake_quant)
-                new_module.weight_indices = indices
-                new_module.weight_codebook = codebook
+            if not args.use_vq:
+                new_module.weight = module.weight
+            else: 
+                if args.fake_quant:
+                    new_module.weight = smoothvq.fasterquant(fake_quant=args.fake_quant)
+                else:
+                    indices, codebook = smoothvq.fasterquant(fake_quant=args.fake_quant)
+                    new_module.weight_indices = indices
+                    new_module.weight_codebook = codebook
             smoothvq.free()
         # else:
         #     new_module.weight_indices = module.indices

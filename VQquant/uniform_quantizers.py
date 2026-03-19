@@ -5,6 +5,7 @@ import inspect
 import warnings
 
 import torch
+import torch_npu
 from torch import nn
 from torch.autograd import Function
 
