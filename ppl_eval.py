@@ -79,6 +79,37 @@ parser.add_argument(
     default=None,
     help="comma-separated devices for VQ quantization, e.g. npu:0,npu:1; evaluation still runs on --device",
 )
+parser.add_argument("--profile", action="store_true", help="Enable Ascend PyTorch profiler during llama_eval")
+parser.add_argument(
+    "--profile-dir",
+    type=str,
+    default="./prof_result",
+    help="Directory to store profiler traces",
+)
+parser.add_argument(
+    "--profile-wait",
+    type=int,
+    default=1,
+    help="Profiler schedule wait steps",
+)
+parser.add_argument(
+    "--profile-warmup",
+    type=int,
+    default=1,
+    help="Profiler schedule warmup steps",
+)
+parser.add_argument(
+    "--profile-active",
+    type=int,
+    default=3,
+    help="Profiler schedule active steps",
+)
+parser.add_argument(
+    "--profile-repeat",
+    type=int,
+    default=1,
+    help="Profiler schedule repeat count",
+)
 
 args = parser.parse_args()
 
@@ -104,6 +135,40 @@ def resolve_device(device):
 device = resolve_device(args.device)
 DEV = device
 print(f"Using device: {device}")
+
+
+def build_profiler(args, device):
+    if not args.profile:
+        return None
+    if device.type != "npu":
+        raise RuntimeError("--profile currently requires --device to be an NPU device.")
+    if torch_npu is None:
+        raise RuntimeError("--profile requires torch_npu to be installed.")
+
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+        l2_cache=False,
+        data_simplification=False,
+    )
+    return torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.CPU,
+            torch_npu.profiler.ProfilerActivity.NPU,
+        ],
+        schedule=torch_npu.profiler.schedule(
+            wait=args.profile_wait,
+            warmup=args.profile_warmup,
+            active=args.profile_active,
+            repeat=args.profile_repeat,
+        ),
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(args.profile_dir),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_modules=False,
+        experimental_config=experimental_config,
+    )
 
 def load_groupql_checkpoint(model, ckpt_path):
     try:
@@ -180,4 +245,15 @@ if device.type == "npu" and hasattr(torch, "npu"):
     torch.npu.set_device(device)
 model = model.to(device)
 print(f"Running llama_eval on device: {device}")
-llama_eval(model, testloader, DEV)
+profiler = build_profiler(args, device)
+if profiler is None:
+    llama_eval(model, testloader, DEV)
+else:
+    print(
+        "Profiler enabled: "
+        f"wait={args.profile_wait}, warmup={args.profile_warmup}, "
+        f"active={args.profile_active}, repeat={args.profile_repeat}, "
+        f"output={args.profile_dir}"
+    )
+    with profiler:
+        llama_eval(model, testloader, DEV, profiler=profiler)

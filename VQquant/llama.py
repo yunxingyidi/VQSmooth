@@ -155,7 +155,7 @@ def llama_sequential(model, dataloader, dev, args):
     return quantizers
 
 @torch.no_grad()
-def llama_eval(model, testenc, dev):
+def llama_eval(model, testenc, dev, profiler=None):
 
     testenc = testenc.input_ids
     nsamples = testenc.numel() // model.seqlen
@@ -213,6 +213,8 @@ def llama_eval(model, testenc, dev):
             elif position_ids is not None:
                 layer_kwargs["position_ids"] = position_ids
             outs[j] = layer(inps[j].unsqueeze(0), **layer_kwargs)[0]
+            if profiler is not None:
+                profiler.step()
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()

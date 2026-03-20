@@ -6,6 +6,7 @@ import torch_npu
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
+from torch.autograd.profiler import record_function
 from group_quant import GroupQLinear, QuantTensor, quantize_linears_in_parallel
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import  LlamaRotaryEmbedding, repeat_kv, apply_rotary_pos_emb
@@ -49,20 +50,29 @@ class QuantLlamaMLP(nn.Module):
     def forward(self, x):
         # down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         if not self.fake_quant:
-            x_quant = QuantTensor(x)
-            gate_q = self.gate_proj(x_quant)  # QuantTensor
-
-            up_q = self.up_proj(x_quant)
-
-            activation = self.act_fn(gate_q.dequantize()) * up_q.dequantize()
-            hidden_f = QuantTensor(activation)
-
-            out_q = self.down_proj(hidden_f)
-            return out_q.dequantize()
+            with record_function("vqsmooth.mlp.input_quant"):
+                x_quant = QuantTensor(x)
+            with record_function("vqsmooth.mlp.gate_proj"):
+                gate_q = self.gate_proj(x_quant)
+            with record_function("vqsmooth.mlp.up_proj"):
+                up_q = self.up_proj(x_quant)
+            with record_function("vqsmooth.mlp.activation_fuse"):
+                activation = self.act_fn(gate_q.dequantize()) * up_q.dequantize()
+            with record_function("vqsmooth.mlp.hidden_quant"):
+                hidden_f = QuantTensor(activation)
+            with record_function("vqsmooth.mlp.down_proj"):
+                out_q = self.down_proj(hidden_f)
+            with record_function("vqsmooth.mlp.output_dequant"):
+                return out_q.dequantize()
         else:
-            gate_q = self.gate_proj(x)
-            up_q = self.up_proj(x)
-            out_q = self.down_proj(self.act_fn(gate_q) * up_q)
+            with record_function("vqsmooth.mlp.gate_proj"):
+                gate_q = self.gate_proj(x)
+            with record_function("vqsmooth.mlp.up_proj"):
+                up_q = self.up_proj(x)
+            with record_function("vqsmooth.mlp.activation_fuse"):
+                hidden = self.act_fn(gate_q) * up_q
+            with record_function("vqsmooth.mlp.down_proj"):
+                out_q = self.down_proj(hidden)
             return out_q
 
 class QuantLlamaAttention(nn.Module):
@@ -129,18 +139,26 @@ class QuantLlamaAttention(nn.Module):
 
         else:
             if not self.fake_quant:
-                q_hidden_states = QuantTensor(hidden_states)
-                query_states = self.q_proj(q_hidden_states)
-                key_states = self.k_proj(q_hidden_states)
-                value_states = self.v_proj(q_hidden_states)
+                with record_function("vqsmooth.attn.input_quant"):
+                    q_hidden_states = QuantTensor(hidden_states)
+                with record_function("vqsmooth.attn.q_proj"):
+                    query_states = self.q_proj(q_hidden_states)
+                with record_function("vqsmooth.attn.k_proj"):
+                    key_states = self.k_proj(q_hidden_states)
+                with record_function("vqsmooth.attn.v_proj"):
+                    value_states = self.v_proj(q_hidden_states)
 
-                query_states = query_states.dequantize()
-                key_states = key_states.dequantize()
-                value_states = value_states.dequantize()
+                with record_function("vqsmooth.attn.qkv_dequant"):
+                    query_states = query_states.dequantize()
+                    key_states = key_states.dequantize()
+                    value_states = value_states.dequantize()
             else:
-                query_states = self.q_proj(hidden_states)
-                key_states = self.k_proj(hidden_states)
-                value_states = self.v_proj(hidden_states)
+                with record_function("vqsmooth.attn.q_proj"):
+                    query_states = self.q_proj(hidden_states)
+                with record_function("vqsmooth.attn.k_proj"):
+                    key_states = self.k_proj(hidden_states)
+                with record_function("vqsmooth.attn.v_proj"):
+                    value_states = self.v_proj(hidden_states)
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -178,25 +196,32 @@ class QuantLlamaAttention(nn.Module):
         else:
             final_mask = causal_mask
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        attn_weights = attn_weights + final_mask
+        with record_function("vqsmooth.attn.qk_matmul"):
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        with record_function("vqsmooth.attn.mask_add"):
+            attn_weights = attn_weights + final_mask
 
-        # softmax
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        with record_function("vqsmooth.attn.softmax"):
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
 
-        attn_output = torch.matmul(attn_weights, value_states)
+        with record_function("vqsmooth.attn.av_matmul"):
+            attn_output = torch.matmul(attn_weights, value_states)
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, -1)
 
         if not output_attentions:
             attn_weights = None
 
         if not self.fake_quant:
-            attn_output = QuantTensor(attn_output)
-            attn_output = self.o_proj(attn_output)
-            return attn_output.dequantize(), attn_weights, past_key_value
+            with record_function("vqsmooth.attn.output_quant"):
+                attn_output = QuantTensor(attn_output)
+            with record_function("vqsmooth.attn.o_proj"):
+                attn_output = self.o_proj(attn_output)
+            with record_function("vqsmooth.attn.output_dequant"):
+                return attn_output.dequantize(), attn_weights, past_key_value
         else:
-            attn_output = self.o_proj(attn_output)
+            with record_function("vqsmooth.attn.o_proj"):
+                attn_output = self.o_proj(attn_output)
             return attn_output, attn_weights, past_key_value
 
     def make_causal_mask(self, bsz, q_len, device, dtype):
