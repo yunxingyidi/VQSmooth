@@ -1,4 +1,5 @@
 from urllib.parse import uses_query
+import pickle
 
 import torch
 try:
@@ -7,6 +8,7 @@ except ImportError:
     torch_npu = None
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers.models.llama.configuration_llama import LlamaConfig
 from Smoothquant.smooth import smooth_lm
 from Smoothquant.group_quant import quantize_model
 import argparse
@@ -62,15 +64,20 @@ parser.add_argument(
 parser.add_argument(
     "--ckpt",
     type=str,
-    default="vq_ckpt.pt",
+    default="vq_smooth_cb8_sv2.pt",
     help="Path to GroupQLinear checkpoint",
 )
 parser.add_argument(
     "--device",
     type=str,
     default="auto",
-    choices=["auto", "npu", "cuda", "cpu"],
     help="device to run evaluation on",
+)
+parser.add_argument(
+    "--vq-devices",
+    type=str,
+    default=None,
+    help="comma-separated devices for VQ quantization, e.g. npu:0,npu:1; evaluation still runs on --device",
 )
 
 args = parser.parse_args()
@@ -79,17 +86,17 @@ args = parser.parse_args()
 def resolve_device(device):
     if device == "auto":
         if torch_npu is not None and hasattr(torch, "npu") and torch.npu.is_available():
-            return torch.device("npu")
+            return torch.device("npu:0")
         if torch.cuda.is_available():
-            return torch.device("cuda")
+            return torch.device("cuda:0")
         return torch.device("cpu")
 
-    if device == "npu":
+    if device.startswith("npu"):
         if torch_npu is None or not hasattr(torch, "npu") or not torch.npu.is_available():
             raise RuntimeError(
                 "Requested NPU, but torch_npu is not installed or no NPU is available."
             )
-        return torch.device("npu")
+        return torch.device(device)
 
     return torch.device(device)
 
@@ -99,14 +106,24 @@ DEV = device
 print(f"Using device: {device}")
 
 def load_groupql_checkpoint(model, ckpt_path):
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    try:
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+    except pickle.UnpicklingError:
+        with torch.serialization.safe_globals([LlamaConfig]):
+            ckpt = torch.load(ckpt_path, map_location="cpu")
 
     state_dict = ckpt["model"] if "model" in ckpt else ckpt
 
-    missing, unexpected = model.load_state_dict(
-        state_dict,
-        strict=True,
-    )
+    incompat = model.load_state_dict(state_dict, strict=True)
+
+    if incompat.missing_keys or incompat.unexpected_keys:
+        raise RuntimeError(
+            "Checkpoint structure does not match the current quantized model. "
+            f"missing_keys={incompat.missing_keys}, "
+            f"unexpected_keys={incompat.unexpected_keys}"
+        )
 
     print("[GroupQLinear] checkpoint loaded")
 
@@ -137,8 +154,6 @@ if args.eval_only:
         args
     )
     load_groupql_checkpoint(model, args.ckpt)
-    print("Llama eval")
-    llama_eval(model, testloader, DEV)
 else:
     if args.smooth:
         print("Smooth quantize...")
@@ -160,4 +175,9 @@ else:
             "config": model.config,  # 如果你是 HF LLaMA
         }
         torch.save(checkpoint, ckpt_name)
+
+if device.type == "npu" and hasattr(torch, "npu"):
+    torch.npu.set_device(device)
+model = model.to(device)
+print(f"Running llama_eval on device: {device}")
 llama_eval(model, testloader, DEV)

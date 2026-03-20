@@ -1,10 +1,11 @@
 import sys, os
 sys.path.append(os.path.dirname(__file__))
+from concurrent.futures import ThreadPoolExecutor
 import torch
 import torch_npu
 from torch import nn
 from dataclasses import dataclass
-from Smoothquant.GroupQuant.group_quant_algorithm import (
+from Smoothquant.GroupQuant.group_quant_npu import (
     fake_quantize_activation_per_token,
     group_dequantize,
     group_quantize,
@@ -14,9 +15,12 @@ from VQquant.smooth_vq import SmoothVQ
 from VQquant.vector_quant import VectorQuantizer
 
 try:
-    import VectorQuant
+    from VQquant.VectorQuant import vector_quant_npu as VectorQuant
 except ModuleNotFoundError:
-    VectorQuant = None
+    try:
+        import VectorQuant
+    except ModuleNotFoundError:
+        VectorQuant = None
 
 # @torch.no_grad()
 # def quantize_activation_per_token_absmax(t, n_bits=8):
@@ -244,9 +248,19 @@ class GroupQLinear(nn.Module):
 
     @staticmethod
     def from_float(
-        module, args, QClass
+        module, args, QClass, quant_device=None, target_device=None
     ):
         assert isinstance(module, torch.nn.Linear)
+        if quant_device is None:
+            quant_device = module.weight.device
+        if target_device is None:
+            target_device = module.weight.device
+
+        quant_device = torch.device(quant_device)
+        target_device = torch.device(target_device)
+        if quant_device.type == "npu":
+            torch.npu.set_device(quant_device)
+
         n_groups = int(module.in_features / args.sub_vector)
         new_module = GroupQLinear(
             in_features=module.in_features,
@@ -257,26 +271,47 @@ class GroupQLinear(nn.Module):
             codebook_width=args.codebook_width
         )
         if not args.eval_only:
-            smoothvq = SmoothVQ(module)
+            if module.weight.device != quant_device:
+                quant_module = torch.nn.Linear(
+                    module.in_features,
+                    module.out_features,
+                    bias=module.bias is not None,
+                    dtype=module.weight.dtype,
+                    device=quant_device,
+                )
+                quant_module.weight.data.copy_(module.weight.data.to(quant_device))
+                if module.bias is not None:
+                    quant_module.bias.data.copy_(module.bias.data.to(quant_device))
+                smoothvq = SmoothVQ(quant_module)
             smoothvq.quantizer = QClass()
             smoothvq.quantizer.configure(codebook_width=args.codebook_width)
             if not args.use_vq:
-                new_module.weight = module.weight
+                new_module.weight = module.weight.to(target_device)
             else: 
                 if args.fake_quant:
-                    new_module.weight = smoothvq.fasterquant(fake_quant=args.fake_quant)
+                    new_module.weight = smoothvq.fasterquant(
+                        fake_quant=args.fake_quant
+                    ).to(target_device)
                 else:
                     indices, codebook = smoothvq.fasterquant(fake_quant=args.fake_quant)
-                    new_module.weight_indices = indices
-                    new_module.weight_codebook = codebook
+                    new_module.weight_indices = indices.to(target_device)
+                    new_module.weight_codebook = codebook.to(target_device)
             smoothvq.free()
+            if quant_module is not module:
+                del quant_module
+                
+            # else:
+            #     # quant_module = module
+            #     indices, codebook = smoothvq.fasterquant(fake_quant=args.fake_quant)
+            #     new_module.weight_indices = indices.to(target_device)
+            #     new_module.weight_codebook = codebook.to(target_device)
         # else:
         #     new_module.weight_indices = module.indices
         #     new_module.weight_codebook = module.codebook
 
         if module.bias is not None:
-            new_module.bias = module.bias
-        return new_module
+            new_module.bias = module.bias.to(target_device)
+        return new_module.to(target_device)
 
     def __repr__(self):
         return f"GroupQLinear({self.in_features}, {self.out_features}, bias={self.bias is not None}, act_quant={self.act_quant_name}, output_quant={self.output_quant_name})"
@@ -312,15 +347,66 @@ def quantize_llama_like(
             codebook_width=args.codebook_width,
         )
 
-        if isinstance(m, (LlamaMLP, MistralMLP)) and layer_counter == 0:
+        if isinstance(m, (LlamaMLP, MistralMLP)):
             print(parent_name, child_name)
             setattr(parent, child_name, QuantLlamaMLP(m, m.config, args, QClass=QClass))
             layer_counter += 1
-        # if isinstance(m, (LlamaAttention, MistralAttention)):
-        #     print(parent_name, child_name)
-        #     setattr(parent, child_name, QuantLlamaAttention(m, m.config, layer_idx=layer_counter, args=args, QClass=QClass))
-        #     layer_counter += 1
+        if isinstance(m, (LlamaAttention, MistralAttention)):
+            print(parent_name, child_name)
+            setattr(
+                parent,
+                child_name,
+                QuantLlamaAttention(
+                    m,
+                    m.config,
+                    layer_idx=layer_counter,
+                    args=args,
+                    QClass=QClass,
+                ),
+            )
+            layer_counter += 1
     return model
+
+
+def quantize_linears_in_parallel(linear_specs, args, QClass, quant_devices, target_device):
+    if not quant_devices:
+        quant_devices = [str(target_device)]
+
+    devices = [torch.device(device.strip()) for device in quant_devices if device.strip()]
+    if not devices:
+        devices = [torch.device(target_device)]
+
+    if len(devices) == 1:
+        device = devices[0]
+        return {
+            name: GroupQLinear.from_float(
+                module,
+                args,
+                QClass=QClass,
+                quant_device=device,
+                target_device=target_device,
+            )
+            for name, module in linear_specs
+        }
+
+    print(f"Running {str(linear_specs)} VQ on devices: {', '.join(str(device) for device in devices)}")
+    futures = {}
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(len(linear_specs), len(devices))) as executor:
+        for idx, (name, module) in enumerate(linear_specs):
+            device = devices[idx % len(devices)]
+            futures[name] = executor.submit(
+                GroupQLinear.from_float,
+                module,
+                args,
+                QClass,
+                device,
+                target_device,
+            )
+        for name, future in futures.items():
+            results[name] = future.result()
+
+    return results
 
 def quantize_model(
     model,

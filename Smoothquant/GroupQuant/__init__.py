@@ -1,5 +1,5 @@
 try:
-    from .group_quant_algorithm import (
+    from .group_quant_npu import (
         GroupQuantizedTensor,
         fake_quantize_activation_per_token,
         group_dequantize,

@@ -9,3 +9,5 @@ python act_scales/generate_scales.py \
     --dataset-path "/home/zhangtairan/databsets/train-00000-of-00001.parquet"
 
 python accuracy_eval.py  --model "/home/zhangtr/WorkSpace/models/llama-2-7b-hf/"  --act_scales_path act_scales/llama-2-7b.pt  --alpha 1 --use-vq  --assignment-chunk-size 32  --dataset wikitext2
+
+python ppl_eval.py  --model "/home/zhangta 

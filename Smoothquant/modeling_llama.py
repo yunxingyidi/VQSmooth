@@ -6,7 +6,7 @@ import torch_npu
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
-from group_quant import GroupQLinear, QuantTensor
+from group_quant import GroupQLinear, QuantTensor, quantize_linears_in_parallel
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import  LlamaRotaryEmbedding, repeat_kv, apply_rotary_pos_emb
 from transformers.utils import logging
@@ -23,9 +23,26 @@ class QuantLlamaMLP(nn.Module):
         self.QClass = QClass
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = GroupQLinear.from_float(float_mlp.gate_proj, args, QClass=QClass)
-        self.up_proj = GroupQLinear.from_float(float_mlp.up_proj, args, QClass=QClass)
-        self.down_proj = GroupQLinear.from_float(float_mlp.down_proj, args, QClass=QClass)
+        target_device = float_mlp.gate_proj.weight.device
+        if args.vq_devices:
+            devices = [item.strip() for item in args.vq_devices.split(",") if item.strip()]
+        else:
+            devices = [str(target_device)]
+
+        quantized = quantize_linears_in_parallel(
+            [
+                ("gate_proj", float_mlp.gate_proj),
+                ("up_proj", float_mlp.up_proj),
+                ("down_proj", float_mlp.down_proj),
+            ],
+            args,
+            QClass=QClass,
+            quant_devices=devices,
+            target_device=target_device,
+        )
+        self.gate_proj = quantized["gate_proj"]
+        self.up_proj = quantized["up_proj"]
+        self.down_proj = quantized["down_proj"]
 
         self.act_fn = ACT2FN[config.hidden_act]
 

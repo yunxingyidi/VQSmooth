@@ -117,7 +117,6 @@ def fake_quantize_activation_per_token(
     residual_group: int = 32,
     residual_bits: int = 4,
 ) -> torch.Tensor:
-    print("Group Quant")
     return group_quantize_dequantize(
         t,
         n_bits=n_bits,
