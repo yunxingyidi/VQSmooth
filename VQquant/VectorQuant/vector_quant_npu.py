@@ -11,9 +11,7 @@ def dequant_forward(
     w_indices: torch.Tensor,
     w_codebook: torch.Tensor,
     w_dq: torch.Tensor,
-    n: int,
 ) -> None:
-    del n  # Kept for API compatibility with the legacy extension.
 
     if w_indices.dim() != 2:
         raise ValueError(f"Expected w_indices to be 2D, got {tuple(w_indices.shape)}")

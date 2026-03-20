@@ -64,7 +64,7 @@ parser.add_argument(
 parser.add_argument(
     "--ckpt",
     type=str,
-    default="vq_smooth_cb8_sv2.pt",
+    default="vq_smooth_cb8_sv2_int8.pt",
     help="Path to GroupQLinear checkpoint",
 )
 parser.add_argument(

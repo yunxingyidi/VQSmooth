@@ -53,7 +53,8 @@ def llama_sequential(model, dataloader, dev, args):
             inps[cache["i"]] = inp
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
-            cache["position_ids"] = kwargs["position_ids"]
+            cache["position_ids"] = kwargs.get("position_ids")
+            cache["position_embeddings"] = kwargs.get("position_embeddings")
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -73,6 +74,7 @@ def llama_sequential(model, dataloader, dev, args):
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
     position_ids = cache["position_ids"]
+    position_embeddings = cache.get("position_embeddings")
 
     print("Creating quantizer...")
     QClass = lambda: VectorQuantizer(
@@ -116,9 +118,12 @@ def llama_sequential(model, dataloader, dev, args):
             for name in subset:
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
             for j in range(args.nsamples):
-                outs[j] = layer(
-                    inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids
-                )[0]
+                layer_kwargs = {"attention_mask": attention_mask}
+                if position_embeddings is not None:
+                    layer_kwargs["position_embeddings"] = position_embeddings
+                elif position_ids is not None:
+                    layer_kwargs["position_ids"] = position_ids
+                outs[j] = layer(inps[j].unsqueeze(0), **layer_kwargs)[0]
             for h in handles:
                 h.remove()
             for name in subset:
@@ -131,9 +136,12 @@ def llama_sequential(model, dataloader, dev, args):
                 smoothvq[name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(
-                inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids
-            )[0]
+            layer_kwargs = {"attention_mask": attention_mask}
+            if position_embeddings is not None:
+                layer_kwargs["position_embeddings"] = position_embeddings
+            elif position_ids is not None:
+                layer_kwargs["position_ids"] = position_ids
+            outs[j] = layer(inps[j].unsqueeze(0), **layer_kwargs)[0]
 
         layers[i] = layer.cpu()
         del layer
@@ -172,7 +180,8 @@ def llama_eval(model, testenc, dev):
             inps[cache["i"]] = inp
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
-            cache["position_ids"] = kwargs["position_ids"]
+            cache["position_ids"] = kwargs.get("position_ids")
+            cache["position_embeddings"] = kwargs.get("position_embeddings")
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -191,15 +200,19 @@ def llama_eval(model, testenc, dev):
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
     position_ids = cache["position_ids"]
+    position_embeddings = cache.get("position_embeddings")
 
     for i in range(len(layers)):
         print(i)
         # layer = layers[i].to(dev)
         layer = layers[i].to(dev)
         for j in range(nsamples):
-            outs[j] = layer(
-                inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids
-            )[0]
+            layer_kwargs = {"attention_mask": attention_mask}
+            if position_embeddings is not None:
+                layer_kwargs["position_embeddings"] = position_embeddings
+            elif position_ids is not None:
+                layer_kwargs["position_ids"] = position_ids
+            outs[j] = layer(inps[j].unsqueeze(0), **layer_kwargs)[0]
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()

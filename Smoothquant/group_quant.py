@@ -22,15 +22,22 @@ except ModuleNotFoundError:
     except ModuleNotFoundError:
         VectorQuant = None
 
-# @torch.no_grad()
-# def quantize_activation_per_token_absmax(t, n_bits=8):
-#     t_shape = t.shape
-#     t.view(-1, t_shape[-1])
-#     scales = t.abs().max(dim=-1, keepdim=True)[0]
-#     q_max = 2 ** (n_bits - 1) - 1
-#     scales.clamp_(min=1e-5).div_(q_max)
-#     t.div_(scales).round_().mul_(scales)
-#     return t
+@torch.no_grad()
+def quantize_weight_per_channel_absmax(t, n_bits=8):
+    scales = t.abs().max(dim=-1, keepdim=True)[0]
+    q_max = 2 ** (n_bits - 1) - 1
+    scales.clamp_(min=1e-5).div_(q_max)
+    t_q = (t / scales).round().clamp(-q_max, q_max)
+    return t_q, scales
+
+@torch.no_grad()
+def dequantize_weight_per_channel_absmax(t_q, scales):
+    if scales.dim() == 1:
+        if t_q.shape[0] == scales.numel():
+            scales = scales.unsqueeze(-1)
+        elif t_q.shape[-1] == scales.numel():
+            scales = scales.unsqueeze(0)
+    return t_q.float() * scales
 
 @torch.no_grad()
 def quantize_activation_per_tensor_absmax(t, n_bits=8, residual_group=32):
@@ -190,9 +197,17 @@ class GroupQLinear(nn.Module):
         )
         self.register_buffer(
             "weight_codebook",
-            torch.randn(
+            torch.zeros(
                 2 ** self.codebook_width,
                 self.in_features,
+                dtype=torch.int8,
+                requires_grad=False,
+            ),
+        )
+        self.register_buffer(
+            "weight_scales",
+            torch.randn(
+                self.out_features,
                 dtype=torch.bfloat16,
                 requires_grad=False,
             ),
@@ -219,30 +234,37 @@ class GroupQLinear(nn.Module):
         if not self.fake_quant:
             dq_x = x.dequantize()
             if self.weight is not None:
-                weight = self.weight
+                weight = dequantize_weight_per_channel_absmax(
+                    self.weight,
+                    self.weight_scales,
+                )
             else:
                 if VectorQuant is None:
                     raise ModuleNotFoundError(
                         "VectorQuant extension is not available. "
                         "Build/install the VectorQuant extension or disable VQ weight quantization."
                     )
-                weight = torch.zeros(
+                weight_q = torch.zeros(
                     (self.in_features, self.out_features),
-                    dtype=torch.bfloat16,
+                    dtype=torch.int8,
                     device=dq_x.device,
                 )
                 VectorQuant.dequant_forward(
                     self.weight_indices.to(dtype=torch.uint8),
                     self.weight_codebook.to(dtype=torch.bfloat16).t().contiguous(),
-                    weight,
-                    int(self.out_features / 1024 + 1),
+                    weight_q,
                 )
-            y = torch.functional.F.linear(dq_x, weight.t(), self.bias)
+                weight = dequantize_weight_per_channel_absmax(
+                    weight_q.t(),
+                    self.weight_scales,
+                )
+            y = torch.functional.F.linear(dq_x, weight, self.bias)
             q_y = QuantTensor(y)
             return q_y
         else:
             d_x = fake_quantize_activation_per_token(x)
-            y = torch.functional.F.linear(d_x, self.weight, self.bias)
+            weight_dq = dequantize_weight_per_channel_absmax(self.weight, self.weight_scales)
+            y = torch.functional.F.linear(d_x, weight_dq, self.bias)
             y = fake_quantize_activation_per_token(y)
             return y
 
@@ -271,31 +293,54 @@ class GroupQLinear(nn.Module):
             codebook_width=args.codebook_width
         )
         if not args.eval_only:
-            if module.weight.device != quant_device:
-                quant_module = torch.nn.Linear(
-                    module.in_features,
-                    module.out_features,
-                    bias=module.bias is not None,
-                    dtype=module.weight.dtype,
-                    device=quant_device,
+            weight_q, weight_scales = quantize_weight_per_channel_absmax(
+                module.weight.detach().float()
+            )
+            new_module.weight_scales.copy_(
+                weight_scales.squeeze(-1).to(
+                    device=new_module.weight_scales.device,
+                    dtype=new_module.weight_scales.dtype,
                 )
-                quant_module.weight.data.copy_(module.weight.data.to(quant_device))
-                if module.bias is not None:
-                    quant_module.bias.data.copy_(module.bias.data.to(quant_device))
-                smoothvq = SmoothVQ(quant_module)
+            )
+
+            vq_module = torch.nn.Linear(
+                module.in_features,
+                module.out_features,
+                bias=False,
+                device=module.weight.device,
+                dtype=torch.float32,
+            )
+            vq_module.weight.data.copy_(weight_q.to(dtype=vq_module.weight.dtype))
+            if hasattr(module, "smooth_scale"):
+                vq_module.smooth_scale = module.smooth_scale.detach().clone().to(
+                    device=vq_module.weight.device,
+                    dtype=vq_module.weight.dtype,
+                )
+            smoothvq = SmoothVQ(vq_module)
             smoothvq.quantizer = QClass()
             smoothvq.quantizer.configure(codebook_width=args.codebook_width)
-            if not args.use_vq:
-                new_module.weight = module.weight.to(target_device)
-            else: 
-                if args.fake_quant:
-                    new_module.weight = smoothvq.fasterquant(
-                        fake_quant=args.fake_quant
-                    ).to(target_device)
-                else:
-                    indices, codebook = smoothvq.fasterquant(fake_quant=args.fake_quant)
-                    new_module.weight_indices = indices.to(target_device)
-                    new_module.weight_codebook = codebook.to(target_device)
+            if args.fake_quant:
+                vq_weight = smoothvq.fasterquant(fake_quant=args.fake_quant)
+                new_module.weight.copy_(
+                    vq_weight.round().clamp(-127, 127).to(
+                        device=new_module.weight.device,
+                        dtype=new_module.weight.dtype,
+                    )
+                )
+            else:
+                indices, codebook = smoothvq.fasterquant(fake_quant=args.fake_quant)
+                new_module.weight_indices.copy_(
+                    indices.to(
+                        device=new_module.weight_indices.device,
+                        dtype=new_module.weight_indices.dtype,
+                    )
+                )
+                new_module.weight_codebook.copy_(
+                    codebook.round().clamp(-127, 127).to(
+                        device=new_module.weight_codebook.device,
+                        dtype=new_module.weight_codebook.dtype,
+                    )
+                )
             smoothvq.free()
             if quant_module is not module:
                 del quant_module
