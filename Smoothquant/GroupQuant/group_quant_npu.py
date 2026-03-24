@@ -41,7 +41,7 @@ def group_quantize(
     delta_base = delta.amax(dim=-1)
 
     r = (delta_base / (1 << residual_bits)).unsqueeze(-1)
-    safe_r = torch.where(r == 0, torch.full_like(r, 1e-5), r)
+    safe_r = r.clamp_min(1e-5)
 
     e = torch.round((delta - delta_base.unsqueeze(-1)) / safe_r)
     e = e.clamp_(min=e_min, max=0).to(torch.int8)

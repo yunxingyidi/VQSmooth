@@ -97,7 +97,7 @@ class SmoothVQ:
         if fake_quant:
             Q, assmt = vq_quantize(W, self.quantizer, fake_quant=fake_quant)
             if isinstance(self.layer, transformers.Conv1D):
-                Q = Q.t()
+                Q = Q.t() 
             # max_err = (W.cpu() - Q.cpu()).abs().mean().item()
             # print(max_err)
             return Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)

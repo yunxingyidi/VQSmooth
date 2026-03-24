@@ -14,6 +14,7 @@ from Smoothquant.GroupQuant.group_quant_npu import (
 )
 from VQquant.smooth_vq import SmoothVQ
 from VQquant.vector_quant import VectorQuantizer
+from fuse_linear import fuse_dequant_with_linear
 
 try:
     from VQquant.VectorQuant import vector_quant_npu as VectorQuant
@@ -235,8 +236,8 @@ class GroupQLinear(nn.Module):
     @torch.no_grad()
     def forward(self, x):
         if not self.fake_quant:
-            with record_function("vqsmooth.groupqlinear.input_dequant"):
-                dq_x = x.dequantize()
+            # with record_function("vqsmooth.groupqlinear.input_dequant"):
+            #     dq_x = x.dequantize()
             if self.weight is not None:
                 with record_function("vqsmooth.groupqlinear.weight_dequant"):
                     weight = dequantize_weight_per_channel_absmax(
@@ -251,22 +252,23 @@ class GroupQLinear(nn.Module):
                     )
                 with record_function("vqsmooth.groupqlinear.vq_weight_decode"):
                     weight_q = torch.zeros(
-                        (self.in_features, self.out_features),
+                        (self.out_features, self.in_features),
                         dtype=torch.int8,
-                        device=dq_x.device,
+                        device=x.activation.device,
                     )
                     VectorQuant.dequant_forward(
-                        self.weight_indices.to(dtype=torch.uint8),
-                        self.weight_codebook.to(dtype=torch.bfloat16).t().contiguous(),
+                        self.weight_indices,
+                        self.weight_codebook,
                         weight_q,
                     )
-                with record_function("vqsmooth.groupqlinear.weight_dequant"):
-                    weight = dequantize_weight_per_channel_absmax(
-                        weight_q.t(),
-                        self.weight_scales,
-                    )
-            with record_function("vqsmooth.groupqlinear.linear"):
-                y = torch.functional.F.linear(dq_x, weight, self.bias)
+            #     with record_function("vqsmooth.groupqlinear.weight_dequant"):
+            #         weight = dequantize_weight_per_channel_absmax(
+            #             weight_q.t(),
+            #             self.weight_scales,
+            #         )
+            # with record_function("vqsmooth.groupqlinear.linear"):
+            #     y = torch.functional.F.linear(dq_x, weight, self.bias)
+            y = fuse_dequant_with_linear(x, weight_q, self.weight_scales)
             with record_function("vqsmooth.groupqlinear.output_quant"):
                 q_y = QuantTensor(y)
             return q_y
