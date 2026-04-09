@@ -4,7 +4,6 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 import torch_npu
 from torch import nn
-from torch.autograd.profiler import record_function
 from dataclasses import dataclass
 from Smoothquant.GroupQuant.group_quant_npu import (
     fake_quantize_activation_per_token,
@@ -14,7 +13,19 @@ from Smoothquant.GroupQuant.group_quant_npu import (
 )
 from VQquant.smooth_vq import SmoothVQ
 from VQquant.vector_quant import VectorQuantizer
-from fuse_linear import fuse_dequant_with_linear
+# from fuse_linear import (
+#     build_group_reduce_matmul_weight_cache,
+#     build_quant_reduce_sum_weight_cache,
+#     ensure_nz_format,
+#     fuse_dequant_with_group_reduce_matmul_cached,
+#     fuse_dequant_with_quant_reduce_sum_cached,
+#     reconstruct_activation_scales,
+# )
+
+# try:
+#     from custom_op.group_reduce_matmul.python import group_reduce_matmul as group_reduce_matmul_custom_op
+# except Exception:
+#     group_reduce_matmul_custom_op = None
 
 try:
     from VQquant.VectorQuant import vector_quant_npu as VectorQuant
@@ -24,22 +35,22 @@ except ModuleNotFoundError:
     except ModuleNotFoundError:
         VectorQuant = None
 
-@torch.no_grad()
-def quantize_weight_per_channel_absmax(t, n_bits=8):
-    scales = t.abs().max(dim=-1, keepdim=True)[0]
-    q_max = 2 ** (n_bits - 1) - 1
-    scales.clamp_(min=1e-5).div_(q_max)
-    t_q = (t / scales).round().clamp(-q_max, q_max)
-    return t_q, scales
+# @torch.no_grad()
+# def quantize_weight_per_channel_absmax(t, n_bits=8):
+#     scales = t.abs().max(dim=-1, keepdim=True)[0]
+#     q_max = 2 ** (n_bits - 1) - 1
+#     scales.clamp_(min=1e-5).div_(q_max)
+#     t_q = (t / scales).round().clamp(-q_max, q_max)
+#     return t_q, scales
 
-@torch.no_grad()
-def dequantize_weight_per_channel_absmax(t_q, scales):
-    if scales.dim() == 1:
-        if t_q.shape[0] == scales.numel():
-            scales = scales.unsqueeze(-1)
-        elif t_q.shape[-1] == scales.numel():
-            scales = scales.unsqueeze(0)
-    return t_q.float() * scales
+# @torch.no_grad()
+# def dequantize_weight_per_channel_absmax(t_q, scales):
+#     if scales.dim() == 1:
+#         if t_q.shape[0] == scales.numel():
+#             scales = scales.unsqueeze(-1)
+#         elif t_q.shape[-1] == scales.numel():
+#             scales = scales.unsqueeze(0)
+#     return t_q.float() * scales
 
 @torch.no_grad()
 def quantize_activation_per_tensor_absmax(t, n_bits=8, residual_group=32):
@@ -149,27 +160,25 @@ class QuantTensor:
         self.quantize(x)
 
     def quantize(self, x, n_bits=8, residual_bits=4):
-        with record_function("vqsmooth.quant_tensor.quantize"):
-            qt = group_quantize(
-                x,
-                n_bits=n_bits,
-                residual_group=self.residual_group,
-                residual_bits=residual_bits,
-            )
+        qt = group_quantize(
+            x,
+            n_bits=n_bits,
+            residual_group=self.residual_group,
+            residual_bits=residual_bits,
+        )
         self.activation.copy_(qt.activation)
         self.delta_base.copy_(qt.delta_base)
         self.e.copy_(qt.e)
 
     def dequantize(self, residual_bits=4):
-        with record_function("vqsmooth.quant_tensor.dequantize"):
-            return group_dequantize(
-                self.activation,
-                self.delta_base,
-                self.e,
-                residual_group=self.residual_group,
-                residual_bits=residual_bits,
-                output_dtype=torch.bfloat16,
-            )
+        return group_dequantize(
+            self.activation,
+            self.delta_base,
+            self.e,
+            residual_group=self.residual_group,
+            residual_bits=residual_bits,
+            output_dtype=torch.bfloat16,
+        )
 
 class GroupQLinear(nn.Module):
     def __init__(
@@ -189,6 +198,7 @@ class GroupQLinear(nn.Module):
         self.codebook_width = codebook_width
 
         self.fake_quant = fake_quant
+        self.skip_output_quant = False
 
         self.register_buffer(
             "weight_indices",
@@ -204,18 +214,18 @@ class GroupQLinear(nn.Module):
             torch.zeros(
                 2 ** self.codebook_width,
                 self.in_features,
-                dtype=torch.int8,
-                requires_grad=False,
-            ),
-        )
-        self.register_buffer(
-            "weight_scales",
-            torch.randn(
-                self.out_features,
                 dtype=torch.bfloat16,
                 requires_grad=False,
             ),
         )
+        # self.register_buffer(
+        #     "weight_scales",
+        #     torch.randn(
+        #         self.out_features,
+        #         dtype=torch.bfloat16,
+        #         requires_grad=False,
+        #     ),
+        # )
         if bias:
             self.register_buffer(
                 "bias",
@@ -228,59 +238,46 @@ class GroupQLinear(nn.Module):
 
     def to(self, *args, **kwargs):
         super(GroupQLinear, self).to(*args, **kwargs)
-        # self.weight = self.weight.to(*args, **kwargs)
-        # if self.bias is not None:
-        #     self.bias = self.bias.to(*args, **kwargs)
         return self
+
+    @torch.no_grad()
+    def _decode_weight_q(self, device):
+        if self.weight is not None:
+            return self.weight.to(device=device, dtype=torch.bfloat16)
+
+        if VectorQuant is None:
+            raise ModuleNotFoundError(
+                "VectorQuant extension is not available. "
+                "Build/install the VectorQuant extension or disable VQ weight quantization."
+            )
+
+        weight_q = torch.zeros(
+            (self.out_features, self.in_features),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        VectorQuant.dequant_forward(
+            self.weight_indices.to(device),
+            self.weight_codebook.to(device),
+            weight_q,
+        )
+        return weight_q
+
 
     @torch.no_grad()
     def forward(self, x):
         if not self.fake_quant:
-            # with record_function("vqsmooth.groupqlinear.input_dequant"):
-            #     dq_x = x.dequantize()
-            if self.weight is not None:
-                with record_function("vqsmooth.groupqlinear.weight_dequant"):
-                    weight = dequantize_weight_per_channel_absmax(
-                        self.weight,
-                        self.weight_scales,
-                    )
-            else:
-                if VectorQuant is None:
-                    raise ModuleNotFoundError(
-                        "VectorQuant extension is not available. "
-                        "Build/install the VectorQuant extension or disable VQ weight quantization."
-                    )
-                with record_function("vqsmooth.groupqlinear.vq_weight_decode"):
-                    weight_q = torch.zeros(
-                        (self.out_features, self.in_features),
-                        dtype=torch.int8,
-                        device=x.activation.device,
-                    )
-                    VectorQuant.dequant_forward(
-                        self.weight_indices,
-                        self.weight_codebook,
-                        weight_q,
-                    )
-            #     with record_function("vqsmooth.groupqlinear.weight_dequant"):
-            #         weight = dequantize_weight_per_channel_absmax(
-            #             weight_q.t(),
-            #             self.weight_scales,
-            #         )
-            # with record_function("vqsmooth.groupqlinear.linear"):
-            #     y = torch.functional.F.linear(dq_x, weight, self.bias)
-            y = fuse_dequant_with_linear(x, weight_q, self.weight_scales)
-            with record_function("vqsmooth.groupqlinear.output_quant"):
-                q_y = QuantTensor(y)
+            weight_q = self._decode_weight_q(x.activation.device)
+            # weight_dq = dequantize_weight_per_channel_absmax(self.weight, self.weight_scales)
+            bias = self.bias.squeeze(0) if self.bias is not None else None
+            y = torch.nn.functional.linear(x.dequantize(), weight_q, bias)
+            q_y = QuantTensor(y)
             return q_y
         else:
-            with record_function("vqsmooth.groupqlinear.fake_input_quant"):
-                d_x = fake_quantize_activation_per_token(x)
-            with record_function("vqsmooth.groupqlinear.weight_dequant"):
-                weight_dq = dequantize_weight_per_channel_absmax(self.weight, self.weight_scales)
-            with record_function("vqsmooth.groupqlinear.linear"):
-                y = torch.functional.F.linear(d_x, weight_dq, self.bias)
-            with record_function("vqsmooth.groupqlinear.fake_output_quant"):
-                y = fake_quantize_activation_per_token(y)
+            d_x = fake_quantize_activation_per_token(x)
+            # weight_dq = dequantize_weight_per_channel_absmax(self.weight, self.weight_scales)
+            y = torch.functional.F.linear(d_x, self.weight, self.bias)
+            y = fake_quantize_activation_per_token(y)
             return y
 
     @staticmethod
@@ -308,39 +305,24 @@ class GroupQLinear(nn.Module):
             codebook_width=args.codebook_width
         )
         if not args.eval_only:
-            weight_q, weight_scales = quantize_weight_per_channel_absmax(
-                module.weight.detach().float()
-            )
-            new_module.weight_scales.copy_(
-                weight_scales.squeeze(-1).to(
-                    device=new_module.weight_scales.device,
-                    dtype=new_module.weight_scales.dtype,
-                )
-            )
+            # weight_q, weight_scales = quantize_weight_per_channel_absmax(
+            #     module.weight.detach().float()
+            # )
+            # new_module.weight_scales.copy_(
+            #     weight_scales.squeeze(-1).to(
+            #         device=new_module.weight_scales.device,
+            #         dtype=new_module.weight_scales.dtype,
+            #     )
+            # )
 
-            vq_module = torch.nn.Linear(
-                module.in_features,
-                module.out_features,
-                bias=False,
-                device=module.weight.device,
-                dtype=torch.float32,
-            )
-            vq_module.weight.data.copy_(weight_q.to(dtype=vq_module.weight.dtype))
-            if hasattr(module, "smooth_scale"):
-                vq_module.smooth_scale = module.smooth_scale.detach().clone().to(
-                    device=vq_module.weight.device,
-                    dtype=vq_module.weight.dtype,
-                )
-            smoothvq = SmoothVQ(vq_module)
+            smoothvq = SmoothVQ(module)
             smoothvq.quantizer = QClass()
             smoothvq.quantizer.configure(codebook_width=args.codebook_width)
             if args.fake_quant:
                 vq_weight = smoothvq.fasterquant(fake_quant=args.fake_quant)
-                new_module.weight.copy_(
-                    vq_weight.round().clamp(-127, 127).to(
-                        device=new_module.weight.device,
-                        dtype=new_module.weight.dtype,
-                    )
+                new_module.weight = vq_weight.to(
+                    device=new_module.weight.device,
+                    dtype=new_module.weight.dtype,
                 )
             else:
                 indices, codebook = smoothvq.fasterquant(fake_quant=args.fake_quant)
@@ -351,7 +333,7 @@ class GroupQLinear(nn.Module):
                     )
                 )
                 new_module.weight_codebook.copy_(
-                    codebook.round().clamp(-127, 127).to(
+                    codebook.to(
                         device=new_module.weight_codebook.device,
                         dtype=new_module.weight_codebook.dtype,
                     )
@@ -369,9 +351,13 @@ class GroupQLinear(nn.Module):
         #     new_module.weight_indices = module.indices
         #     new_module.weight_codebook = module.codebook
 
+        new_module = new_module.to(target_device)
+        # new_module.build_group_reduce_matmul_cache(n_groups)
+
         if module.bias is not None:
             new_module.bias = module.bias.to(target_device)
-        return new_module.to(target_device)
+
+        return new_module
 
     def __repr__(self):
         return f"GroupQLinear({self.in_features}, {self.out_features}, bias={self.bias is not None}, act_quant={self.act_quant_name}, output_quant={self.output_quant_name})"
@@ -419,7 +405,6 @@ def quantize_llama_like(
                 QuantLlamaAttention(
                     m,
                     m.config,
-                    layer_idx=layer_counter,
                     args=args,
                     QClass=QClass,
                 ),

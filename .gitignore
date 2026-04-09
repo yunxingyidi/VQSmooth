@@ -19,3 +19,7 @@ vq_smooth_cb8_sv2.pt
 /prof_result
 /reports
 /tools
+/group_matmul_add
+/benchmarks
+/custom_op
+

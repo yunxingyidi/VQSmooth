@@ -155,7 +155,7 @@ def llama_sequential(model, dataloader, dev, args):
     return quantizers
 
 @torch.no_grad()
-def llama_eval(model, testenc, dev, profiler=None):
+def llama_eval(model, testenc, dev):
 
     testenc = testenc.input_ids
     nsamples = testenc.numel() // model.seqlen
@@ -202,9 +202,11 @@ def llama_eval(model, testenc, dev, profiler=None):
     position_ids = cache["position_ids"]
     position_embeddings = cache.get("position_embeddings")
 
-    for i in range(len(layers)):
+    final_layer = len(layers) - 1
+    print(f"final layer: {final_layer}")
+    layer_indices = range(final_layer + 1)
+    for i in layer_indices:
         print(i)
-        # layer = layers[i].to(dev)
         layer = layers[i].to(dev)
         for j in range(nsamples):
             layer_kwargs = {"attention_mask": attention_mask}
@@ -213,8 +215,6 @@ def llama_eval(model, testenc, dev, profiler=None):
             elif position_ids is not None:
                 layer_kwargs["position_ids"] = position_ids
             outs[j] = layer(inps[j].unsqueeze(0), **layer_kwargs)[0]
-            if profiler is not None:
-                profiler.step()
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
