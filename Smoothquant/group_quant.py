@@ -13,6 +13,7 @@ from Smoothquant.GroupQuant.group_quant_npu import (
 )
 from VQquant.smooth_vq import SmoothVQ
 from VQquant.vector_quant import VectorQuantizer
+from Smoothquant.fused_quant_linear import fused_quant_linear_vq_cached
 # from fuse_linear import (
 #     build_group_reduce_matmul_weight_cache,
 #     build_quant_reduce_sum_weight_cache,
@@ -135,51 +136,88 @@ def quantize_activation_per_token_absmax(
     )
 
 @dataclass
-class QuantTensor:
+class KVQuantTensor:
     def __init__(
         self,
         x,
         residual_group: int = 32
     ):
         super().__init__()
-        B, T, H = x.shape
-        assert H % residual_group == 0
-        G = H // residual_group
+        if x.dim() != 4:
+            raise ValueError(f"Expected KV tensor with shape [B, H, T, D], got {tuple(x.shape)}")
+
+        B, Hh, T, D = x.shape
+        assert D % residual_group == 0
+        G = D // residual_group
         device = x.device
 
-        self.activation = torch.empty_like(
-            x, device=device, dtype=torch.int8
+        self.batch_size = B
+        self.num_heads = Hh
+        self.seq_len = T
+        self.head_dim = D
+        self.activation = torch.empty(
+            B, Hh, T, D, device=device, dtype=torch.int8
         )
         self.delta_base = torch.empty(
-            B, T, device=device, dtype=torch.bfloat16
+            B, Hh, T, device=device, dtype=torch.bfloat16
         )
         self.e = torch.empty(
-            B, T, G, device=device, dtype=torch.int8
+            B, Hh, T, G, device=device, dtype=torch.int8
         )
         self.residual_group = residual_group
         self.quantize(x)
 
     def quantize(self, x, n_bits=8, residual_bits=4):
+        B, Hh, T, D = x.shape
+        flat_x = x.reshape(B * Hh, T, D)
         qt = group_quantize(
-            x,
+            flat_x,
             n_bits=n_bits,
             residual_group=self.residual_group,
             residual_bits=residual_bits,
         )
-        self.activation.copy_(qt.activation)
-        self.delta_base.copy_(qt.delta_base)
-        self.e.copy_(qt.e)
+        self.activation.copy_(qt.activation.reshape(B, Hh, T, D))
+        self.delta_base.copy_(qt.delta_base.reshape(B, Hh, T))
+        self.e.copy_(qt.e.reshape(B, Hh, T, -1))
 
     def dequantize(self, residual_bits=4):
-        return group_dequantize(
-            self.activation,
-            self.delta_base,
-            self.e,
+        flat = group_dequantize(
+            self.activation.reshape(self.batch_size * self.num_heads, self.seq_len, self.head_dim),
+            self.delta_base.reshape(self.batch_size * self.num_heads, self.seq_len),
+            self.e.reshape(self.batch_size * self.num_heads, self.seq_len, -1),
             residual_group=self.residual_group,
             residual_bits=residual_bits,
             output_dtype=torch.bfloat16,
         )
+        return flat.reshape(self.batch_size, self.num_heads, self.seq_len, self.head_dim)
 
+@dataclass
+class QuantTensor:
+    def __init__(
+        self,
+        x,
+    ):
+        super().__init__()
+        B, T, H = x.shape
+        device = x.device
+
+        self.activation = torch.empty_like(
+            x, device=device, dtype=torch.int8
+        )
+        self.scales = torch.empty(
+            B, T, device=device, dtype=torch.bfloat16
+        )
+        self.quantize(x)
+
+    def quantize(self, x, n_bits=8):
+        q_max = 2 ** (n_bits - 1) - 1
+        self.scales = x.abs().amax(dim=-1, keepdim=True)  # [B, T, 1]
+        self.scales.clamp_(min=1e-5).div_(q_max)
+        self.activation = (x / self.scales).round().clamp(-q_max, q_max)
+
+    def dequantize(self, residual_bits=4):
+        return self.activation * self.scales
+        
 class GroupQLinear(nn.Module):
     def __init__(
         self,
@@ -196,6 +234,7 @@ class GroupQLinear(nn.Module):
         self.n_groups = n_groups
         self.weight = None
         self.codebook_width = codebook_width
+        self._decoded_weight_cache = {}
 
         self.fake_quant = fake_quant
         self.skip_output_quant = False
@@ -237,6 +276,7 @@ class GroupQLinear(nn.Module):
             self.register_buffer("bias", None)
 
     def to(self, *args, **kwargs):
+        self._decoded_weight_cache = {}
         super(GroupQLinear, self).to(*args, **kwargs)
         return self
 
@@ -244,6 +284,12 @@ class GroupQLinear(nn.Module):
     def _decode_weight_q(self, device):
         if self.weight is not None:
             return self.weight.to(device=device, dtype=torch.bfloat16)
+
+        device = torch.device(device)
+        cache_key = str(device)
+        cached = self._decoded_weight_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
         if VectorQuant is None:
             raise ModuleNotFoundError(
@@ -261,18 +307,38 @@ class GroupQLinear(nn.Module):
             self.weight_codebook.to(device),
             weight_q,
         )
+        self._decoded_weight_cache[cache_key] = weight_q
         return weight_q
 
 
     @torch.no_grad()
-    def forward(self, x):
+    def forward(self, x, return_quant_tensor=True):
         if not self.fake_quant:
-            weight_q = self._decode_weight_q(x.activation.device)
+            if isinstance(x, QuantTensor):
+                device = x.activation.device
+                x_source = x
+            else:
+                device = x.device
+                x_source = x
+            weight_q = self._decode_weight_q(device)
+            x_dq = x_source.dequantize() if isinstance(x_source, QuantTensor) else x_source
             # weight_dq = dequantize_weight_per_channel_absmax(self.weight, self.weight_scales)
             bias = self.bias.squeeze(0) if self.bias is not None else None
-            y = torch.nn.functional.linear(x.dequantize(), weight_q, bias)
-            q_y = QuantTensor(y)
-            return q_y
+            y = torch.nn.functional.linear(x_dq, weight_q, bias)
+            out = QuantTensor(y) if return_quant_tensor else y
+            # out = fused_quant_linear_vq_cached(
+            #     x,
+            #     out_features=self.out_features,
+            #     in_features=self.in_features,
+            #     bias=self.bias,
+            #     weight_indices=self.weight_indices,
+            #     weight_codebook=self.weight_codebook,
+            #     decoded_weight_cache=self._decoded_weight_cache,
+            #     cache_key=str(x.activation.device),
+            #     return_quant_tensor=return_quant_tensor,
+            #     quant_tensor_cls=QuantTensor if return_quant_tensor else None,
+            # )
+            return out
         else:
             d_x = fake_quantize_activation_per_token(x)
             # weight_dq = dequantize_weight_per_channel_absmax(self.weight, self.weight_scales)
@@ -399,12 +465,23 @@ def quantize_llama_like(
             layer_counter += 1
         if isinstance(m, (LlamaAttention, MistralAttention)):
             print(parent_name, child_name)
+            layer_idx = None
+            if name.startswith("layers.") or name.startswith("model.layers."):
+                parts = name.split(".")
+                for idx, part in enumerate(parts[:-1]):
+                    if part == "layers" and idx + 1 < len(parts):
+                        try:
+                            layer_idx = int(parts[idx + 1])
+                        except ValueError:
+                            layer_idx = None
+                        break
             setattr(
                 parent,
                 child_name,
                 QuantLlamaAttention(
                     m,
                     m.config,
+                    layer_idx=layer_idx,
                     args=args,
                     QClass=QClass,
                 ),

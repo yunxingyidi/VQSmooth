@@ -6,7 +6,7 @@ import torch_npu
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
-from group_quant import GroupQLinear, QuantTensor, quantize_linears_in_parallel
+from group_quant import GroupQLinear, QuantTensor, quantize_linears_in_parallel, KVQuantTensor
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import  LlamaRotaryEmbedding, repeat_kv, apply_rotary_pos_emb
 from transformers.utils import logging
@@ -50,12 +50,12 @@ class QuantLlamaMLP(nn.Module):
         # down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         if not self.fake_quant:
             x_quant = QuantTensor(x)
-            gate_q = self.gate_proj(x_quant)
-            up_q = self.up_proj(x_quant)
-            activation = self.act_fn(gate_q.dequantize()) * up_q.dequantize()
-            hidden_f = QuantTensor(activation)
-            out_q = self.down_proj(hidden_f)
-            return out_q.dequantize()
+            gate = self.gate_proj(x_quant, return_quant_tensor=False)
+            up = self.up_proj(x_quant, return_quant_tensor=False)
+            activation = self.act_fn(gate) * up
+            activation = QuantTensor(activation)
+            out = self.down_proj(activation, return_quant_tensor=False)
+            return out
         else:
             gate_q = self.gate_proj(x)
             up_q = self.up_proj(x)
@@ -155,14 +155,28 @@ class QuantLlamaAttention(nn.Module):
             cos, sin = position_embeddings
 
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        key_q = KVQuantTensor(key_states)
+        value_q = KVQuantTensor(value_states)
 
         if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            print(f"Past key shape: {past_key_value.key.shape if past_key_value.key is not None else None}")
-            print(f"Past value shape: {past_key_value.value.shape if past_key_value.value is not None else None}")
+            cache_kwargs = {
+                "sin": sin,
+                "cos": cos,
+                "cache_position": cache_position,
+                "k_delta_base": key_q.delta_base,
+                "v_delta_base": value_q.delta_base,
+                "k_e": key_q.e,
+                "v_e": value_q.e,
+            }
+            key_cache_states, value_cache_states = past_key_value.update(
+                key_q.activation, value_q.activation, self.layer_idx, cache_kwargs
+            )
+        else:
+            key_cache_states = key_q
+            value_cache_states = value_q
 
+        key_states = key_cache_states.dequantize()
+        value_states = value_cache_states.dequantize()
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
