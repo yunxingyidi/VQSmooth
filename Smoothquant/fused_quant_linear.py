@@ -1,4 +1,9 @@
 import torch
+from Smoothquant.custom_quant_matmul import run_custom_quant_matmul
+try:
+    import torch_npu  # noqa: F401
+except ModuleNotFoundError:
+    torch_npu = None
 
 try:
     from VQquant.VectorQuant import vector_quant_npu as VectorQuant
@@ -9,186 +14,115 @@ except ModuleNotFoundError:
         VectorQuant = None
 
 
-def decode_vq_weight(
-    weight_indices: torch.Tensor,
-    weight_codebook: torch.Tensor,
-    out_features: int,
-    in_features: int,
-    device: torch.device | str,
-    dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
+@torch.no_grad()
+def prewarm_weight_quant_runtime_cache(module, device):
+    return get_weight_quant_runtime_cache(module, device)
+
+
+@torch.no_grad()
+def weight_quant_int8_npu_forward(module, x_quant):
+    return forward_weight_quant_int8_npu(module, x_quant)
+
+
+@torch.no_grad()
+def weight_quant_int8_fallback_forward(module, x_quant):
+    return forward_weight_quant_int8_fallback_fast(module, x_quant)
+
+
+@torch.no_grad()
+def get_weight_quant_runtime_cache(module, device):
     device = torch.device(device)
+    cache_key = str(device)
+    cached = module._weight_quant_runtime_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if module.weight is not None:
+        raise RuntimeError("weight_quant path expects VQ-backed weights, but got dense weight.")
     if VectorQuant is None:
         raise ModuleNotFoundError(
             "VectorQuant extension is not available. "
-            "Build/install the VectorQuant extension or provide a pre-decoded weight."
+            "Build/install the VectorQuant extension or disable VQ weight quantization."
         )
 
-    weight_q = torch.zeros(
-        (out_features, in_features),
-        dtype=dtype,
-        device=device,
-    )
-    VectorQuant.dequant_forward(
-        weight_indices.to(device),
-        weight_codebook.to(device),
-        weight_q,
-    )
-    return weight_q
-
-
-def maybe_decode_weight(
-    *,
-    weight_q: torch.Tensor | None,
-    weight_indices: torch.Tensor | None,
-    weight_codebook: torch.Tensor | None,
-    out_features: int,
-    in_features: int,
-    device: torch.device | str,
-    dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    if weight_q is not None:
-        return weight_q.to(device=device, dtype=dtype)
-
-    if weight_indices is None or weight_codebook is None:
-        raise ValueError(
-            "Expected either `weight_q` or both `weight_indices` and `weight_codebook`."
-        )
-
-    return decode_vq_weight(
-        weight_indices=weight_indices,
-        weight_codebook=weight_codebook,
-        out_features=out_features,
-        in_features=in_features,
-        device=device,
-        dtype=dtype,
-    )
-
-
-def maybe_dequantize_activation(x):
-    if hasattr(x, "dequantize"):
-        return x.dequantize()
-    return x
-
-
-def fused_quant_linear(
-    x,
-    *,
-    out_features: int,
-    in_features: int,
-    bias: torch.Tensor | None = None,
-    weight_q: torch.Tensor | None = None,
-    weight_indices: torch.Tensor | None = None,
-    weight_codebook: torch.Tensor | None = None,
-    return_quant_tensor: bool = False,
-    quant_tensor_cls=None,
-    decoded_weight_cache: dict | None = None,
-    cache_key=None,
-    dtype: torch.dtype = torch.bfloat16,
-):
-    """
-    Unified entry point for quantized linear forward.
-
-    This is currently a fallback implementation that:
-    1. materializes/decode weights if needed,
-    2. dequantizes activation if `x` is a QuantTensor-like object,
-    3. runs `torch.nn.functional.linear`,
-    4. optionally repacks the output with `quant_tensor_cls`.
-
-    Later, the body of this function can be replaced by a fused custom kernel
-    without changing call sites.
-    """
-    if hasattr(x, "activation"):
-        device = x.activation.device
-    else:
-        device = x.device
-
-    cache_hit = False
-    if decoded_weight_cache is not None and cache_key is not None:
-        cached = decoded_weight_cache.get(cache_key)
-        if cached is not None and cached.device == device and cached.dtype == dtype:
-            decoded_weight = cached
-            cache_hit = True
-        else:
-            decoded_weight = maybe_decode_weight(
-                weight_q=weight_q,
-                weight_indices=weight_indices,
-                weight_codebook=weight_codebook,
-                out_features=out_features,
-                in_features=in_features,
-                device=device,
-                dtype=dtype,
-            )
-            decoded_weight_cache[cache_key] = decoded_weight
-    else:
-        decoded_weight = maybe_decode_weight(
-            weight_q=weight_q,
-            weight_indices=weight_indices,
-            weight_codebook=weight_codebook,
-            out_features=out_features,
-            in_features=in_features,
+    int8_cache_key = f"{device}:int8"
+    weight_q_int8 = module._decoded_weight_cache.get(int8_cache_key)
+    if weight_q_int8 is None:
+        weight_q_int8 = torch.zeros(
+            (module.out_features, module.in_features),
+            dtype=torch.int8,
             device=device,
-            dtype=dtype,
         )
-
-    x_dq = maybe_dequantize_activation(x)
-    bias_term = bias.squeeze(0) if bias is not None and bias.dim() > 1 else bias
-    y = torch.nn.functional.linear(x_dq, decoded_weight, bias_term)
-
-    if return_quant_tensor:
-        if quant_tensor_cls is None:
-            raise ValueError("`quant_tensor_cls` is required when `return_quant_tensor=True`.")
-        return quant_tensor_cls(y)
-
-    return y
-
-
-def fused_quant_linear_vq_cached(
-    x_quant,
-    *,
-    out_features: int,
-    in_features: int,
-    bias: torch.Tensor | None,
-    weight_indices: torch.Tensor,
-    weight_codebook: torch.Tensor,
-    decoded_weight_cache: dict,
-    cache_key,
-    return_quant_tensor: bool = False,
-    quant_tensor_cls=None,
-    dtype: torch.dtype = torch.bfloat16,
-):
-    """
-    Fast path specialized for the current hot inference path:
-    - activation is a per-token QuantTensor-like object with `.activation` and `.dequantize()`
-    - weight is stored as VQ indices + codebook
-    - decoded weight is cached externally in a dict
-    - output is usually returned as bf16
-
-    Compared with `fused_quant_linear`, this version intentionally avoids:
-    - dynamic input-type dispatch
-    - optional weight source branches
-    - generic cache validation logic
-    """
-    device = x_quant.activation.device
-    decoded_weight = decoded_weight_cache.get(cache_key)
-    if decoded_weight is None:
-        decoded_weight = decode_vq_weight(
-            weight_indices=weight_indices,
-            weight_codebook=weight_codebook,
-            out_features=out_features,
-            in_features=in_features,
-            device=device,
-            dtype=dtype,
+        VectorQuant.dequant_forward(
+            module.weight_indices.to(device),
+            module.weight_codebook.to(device),
+            weight_q_int8,
         )
-        decoded_weight_cache[cache_key] = decoded_weight
+        module._decoded_weight_cache[int8_cache_key] = weight_q_int8
 
-    x_dq = x_quant.dequantize()
-    bias_term = bias.squeeze(0) if bias is not None and bias.dim() > 1 else bias
-    y = torch.nn.functional.linear(x_dq, decoded_weight, bias_term)
+    runtime = {
+        "weight_q_int8": weight_q_int8,
+        "weight_q_t_int8": weight_q_int8.transpose(0, 1).contiguous(),
+        "weight_rhs_bf16": weight_q_int8.transpose(0, 1).to(torch.bfloat16).contiguous(),
+        "weight_scales_1d": module.weight_scales.to(device=device, dtype=torch.bfloat16).view(-1),
+        "bias_1d": (
+            module.bias.to(device=device, dtype=torch.bfloat16).view(-1)
+            if module.bias is not None
+            else None
+        ),
+    }
+    module._weight_quant_runtime_cache[cache_key] = runtime
+    return runtime
 
-    if return_quant_tensor:
-        if quant_tensor_cls is None:
-            raise ValueError("`quant_tensor_cls` is required when `return_quant_tensor=True`.")
-        return quant_tensor_cls(y)
 
-    return y
+@torch.no_grad()
+def forward_weight_quant_int8_npu(module, x_quant):
+    bsz, seqlen, hidden = x_quant.activation.shape
+    runtime = get_weight_quant_runtime_cache(module, x_quant.activation.device)
+
+    x1 = x_quant.activation.reshape(bsz * seqlen, hidden).contiguous()
+    pertoken_scale = x_quant.scales.reshape(bsz * seqlen).to(torch.float32)
+    bias = runtime["bias_1d"]
+
+    # Prefer project custom kernel when enabled and available.
+    y2d = run_custom_quant_matmul(
+        x=x1,
+        weight_t_int8=runtime["weight_q_t_int8"],
+        weight_scales_1d=runtime["weight_scales_1d"],
+        pertoken_scale=pertoken_scale,
+        bias=bias,
+        output_dtype=torch.bfloat16,
+    )
+    if y2d is not None:
+        return y2d.reshape(bsz, seqlen, module.out_features)
+
+    if torch_npu is None or not hasattr(torch_npu, "npu_quant_matmul"):
+        return None
+
+    try:
+        y2d = torch_npu.npu_quant_matmul(
+            x1,
+            runtime["weight_q_t_int8"],
+            runtime["weight_scales_1d"],
+            pertoken_scale=pertoken_scale,
+            bias=bias,
+            output_dtype=torch.bfloat16,
+        )
+    except RuntimeError:
+        return None
+    return y2d.reshape(bsz, seqlen, module.out_features)
+
+
+@torch.no_grad()
+def forward_weight_quant_int8_fallback_fast(module, x_quant):
+    bsz, seqlen, hidden = x_quant.activation.shape
+    bt = bsz * seqlen
+    runtime = get_weight_quant_runtime_cache(module, x_quant.activation.device)
+
+    x2d = x_quant.activation.reshape(bt, hidden).to(torch.bfloat16)
+    y2d = torch.matmul(x2d, runtime["weight_rhs_bf16"])
+    y2d.mul_(x_quant.scales.reshape(bt, 1))
+    y2d.mul_(runtime["weight_scales_1d"].view(1, -1))
+    if runtime["bias_1d"] is not None:
+        y2d.add_(runtime["bias_1d"])
+    return y2d.reshape(bsz, seqlen, module.out_features)

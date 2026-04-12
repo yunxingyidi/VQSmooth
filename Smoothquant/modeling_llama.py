@@ -6,9 +6,15 @@ import torch_npu
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
-from group_quant import GroupQLinear, QuantTensor, quantize_linears_in_parallel, KVQuantTensor
+from Smoothquant.group_quant import (
+    GroupQLinear,
+    QuantTensor,
+    quantize_linears_in_parallel,
+    KVQuantTensor,
+)
+from fused_kv_attention import fused_quantized_kv_attention
 from transformers.models.llama.configuration_llama import LlamaConfig
-from transformers.models.llama.modeling_llama import  LlamaRotaryEmbedding, repeat_kv, apply_rotary_pos_emb
+from transformers.models.llama.modeling_llama import  LlamaRotaryEmbedding, apply_rotary_pos_emb, repeat_kv
 from transformers.utils import logging
 from typing import Optional, Tuple
 from transformers.cache_utils import Cache
@@ -155,28 +161,16 @@ class QuantLlamaAttention(nn.Module):
             cos, sin = position_embeddings
 
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        key_q = KVQuantTensor(key_states)
-        value_q = KVQuantTensor(value_states)
-
+        
         if past_key_value is not None:
             cache_kwargs = {
                 "sin": sin,
                 "cos": cos,
                 "cache_position": cache_position,
-                "k_delta_base": key_q.delta_base,
-                "v_delta_base": value_q.delta_base,
-                "k_e": key_q.e,
-                "v_e": value_q.e,
             }
-            key_cache_states, value_cache_states = past_key_value.update(
-                key_q.activation, value_q.activation, self.layer_idx, cache_kwargs
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
             )
-        else:
-            key_cache_states = key_q
-            value_cache_states = value_q
-
-        key_states = key_cache_states.dequantize()
-        value_states = value_cache_states.dequantize()
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
@@ -189,17 +183,28 @@ class QuantLlamaAttention(nn.Module):
         else:
             final_mask = causal_mask
 
+        # attn_output, attn_weights = fused_quantized_kv_attention(
+        #     key_states,
+        #     key_cache_states,
+        #     value_states,
+        #     num_key_value_groups=self.num_key_value_groups,
+        #     attention_mask=final_mask,
+        #     head_dim=self.head_dim,
+        #     output_attentions=output_attentions,
+        #     training=self.training,
+        #     attention_dropout=self.attention_dropout,
+        # )
+
+        # Original unfused path kept here for side-by-side debugging.
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         attn_weights = attn_weights + final_mask
 
+        # softmax
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
 
         attn_output = torch.matmul(attn_weights, value_states)
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, -1)
-
-        if not output_attentions:
-            attn_weights = None
 
         if not self.fake_quant:
             attn_output = QuantTensor(attn_output)

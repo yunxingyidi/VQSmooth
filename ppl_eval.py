@@ -10,8 +10,13 @@ except ImportError:
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.models.llama.configuration_llama import LlamaConfig
 from Smoothquant.smooth import smooth_lm
-from Smoothquant.group_quant import quantize_model
+from Smoothquant.group_quant import (
+    quantize_model,
+    GroupQLinear,
+    prewarm_weight_quant_runtime_cache,
+)
 import argparse
+import time
 import sys
 sys.path.append(".")
 from VQquant.llama import get_llama, llama_eval, llama_sequential
@@ -32,6 +37,8 @@ parser.add_argument("--group-quantize", action="store_true")
 parser.add_argument("--save-model", action="store_true")
 parser.add_argument("--eval-only", action="store_true")
 parser.add_argument("--fake-quant", action="store_true")
+parser.add_argument("--weight-quant", action="store_true")
+parser.add_argument("--profile-eval", action="store_true")
 parser.add_argument(
         "--seed", type=int, default=0, help="Seed for sampling the calibration data."
     )
@@ -64,7 +71,7 @@ parser.add_argument(
 parser.add_argument(
     "--ckpt",
     type=str,
-    default="vq_smooth_cb8_sv2.pt",
+    default="vq_smooth_cb8_sv2_int8.pt",
     help="Path to GroupQLinear checkpoint",
 )
 parser.add_argument(
@@ -137,8 +144,19 @@ def build_ckpt_name(args):
     parts.append("smooth" if args.smooth else "nosmooth")
     parts.append(f"cb{args.codebook_width}")
     parts.append(f"sv{args.sub_vector}")
+    parts.append("wq8" if args.weight_quant else "wbf16")
 
     return "_".join(parts) + ".pt"
+
+
+@torch.no_grad()
+def prewarm_weight_quant_caches(model, device):
+    warmed = 0
+    for module in model.modules():
+        if isinstance(module, GroupQLinear) and getattr(module, "weight_quant", False):
+            prewarm_weight_quant_runtime_cache(module, device)
+            warmed += 1
+    return warmed
 
 model = AutoModelForCausalLM.from_pretrained(
     args.model, torch_dtype=torch.bfloat16
@@ -189,5 +207,23 @@ if device.type == "npu" and hasattr(torch, "npu"):
     torch.npu.set_device(device)
 if next(model.parameters()).device != device:
     model = model.to(device)
+
+if args.weight_quant:
+    prewarm_start = time.perf_counter()
+    warmed_layers = prewarm_weight_quant_caches(model, device)
+    prewarm_seconds = time.perf_counter() - prewarm_start
+    print(
+        f"Weight-quant prewarm done: layers={warmed_layers}, "
+        f"elapsed={prewarm_seconds:.3f}s"
+    )
+
 print(f"Running llama_eval on device: {device}")
-llama_eval(model, testloader, DEV)
+eval_start = time.perf_counter()
+llama_eval(model, testloader, DEV, profile=args.profile_eval)
+eval_seconds = time.perf_counter() - eval_start
+
+testenc = testloader.input_ids
+total_tokens = testenc.numel()
+tok_per_s = total_tokens / eval_seconds if eval_seconds > 0 else float("inf")
+print(f"Eval elapsed: {eval_seconds:.3f}s")
+print(f"Eval throughput: {tok_per_s:.2f} tok/s (total_tokens={total_tokens})")

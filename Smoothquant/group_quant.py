@@ -13,7 +13,10 @@ from Smoothquant.GroupQuant.group_quant_npu import (
 )
 from VQquant.smooth_vq import SmoothVQ
 from VQquant.vector_quant import VectorQuantizer
-from Smoothquant.fused_quant_linear import fused_quant_linear_vq_cached
+from Smoothquant.fused_quant_linear import (
+    weight_quant_int8_npu_forward,
+    weight_quant_int8_fallback_forward,
+)
 # from fuse_linear import (
 #     build_group_reduce_matmul_weight_cache,
 #     build_quant_reduce_sum_weight_cache,
@@ -36,22 +39,22 @@ except ModuleNotFoundError:
     except ModuleNotFoundError:
         VectorQuant = None
 
-# @torch.no_grad()
-# def quantize_weight_per_channel_absmax(t, n_bits=8):
-#     scales = t.abs().max(dim=-1, keepdim=True)[0]
-#     q_max = 2 ** (n_bits - 1) - 1
-#     scales.clamp_(min=1e-5).div_(q_max)
-#     t_q = (t / scales).round().clamp(-q_max, q_max)
-#     return t_q, scales
+@torch.no_grad()
+def quantize_weight_per_channel_absmax(t, n_bits=8):
+    scales = t.abs().max(dim=-1, keepdim=True)[0]
+    q_max = 2 ** (n_bits - 1) - 1
+    scales.clamp_(min=1e-5).div_(q_max)
+    t_q = (t / scales).round().clamp(-q_max, q_max)
+    return t_q, scales
 
-# @torch.no_grad()
-# def dequantize_weight_per_channel_absmax(t_q, scales):
-#     if scales.dim() == 1:
-#         if t_q.shape[0] == scales.numel():
-#             scales = scales.unsqueeze(-1)
-#         elif t_q.shape[-1] == scales.numel():
-#             scales = scales.unsqueeze(0)
-#     return t_q.float() * scales
+@torch.no_grad()
+def dequantize_weight_per_channel_absmax(t_q, scales):
+    if scales.dim() == 1:
+        if t_q.shape[0] == scales.numel():
+            scales = scales.unsqueeze(-1)
+        elif t_q.shape[-1] == scales.numel():
+            scales = scales.unsqueeze(0)
+    return t_q.to(dtype=torch.bfloat16) * scales
 
 @torch.no_grad()
 def quantize_activation_per_tensor_absmax(t, n_bits=8, residual_group=32):
@@ -205,7 +208,7 @@ class QuantTensor:
             x, device=device, dtype=torch.int8
         )
         self.scales = torch.empty(
-            B, T, device=device, dtype=torch.bfloat16
+            B, T, 1, device=device, dtype=torch.bfloat16
         )
         self.quantize(x)
 
@@ -213,10 +216,10 @@ class QuantTensor:
         q_max = 2 ** (n_bits - 1) - 1
         self.scales = x.abs().amax(dim=-1, keepdim=True)  # [B, T, 1]
         self.scales.clamp_(min=1e-5).div_(q_max)
-        self.activation = (x / self.scales).round().clamp(-q_max, q_max)
+        self.activation = (x / self.scales).round().clamp(-q_max, q_max).to(torch.int8)
 
     def dequantize(self, residual_bits=4):
-        return self.activation * self.scales
+        return self.activation.to(torch.bfloat16) * self.scales
         
 class GroupQLinear(nn.Module):
     def __init__(
@@ -227,6 +230,7 @@ class GroupQLinear(nn.Module):
         codebook_width,
         bias=True,
         fake_quant=False,
+        weight_quant=False
     ):
         super().__init__()
         self.in_features = in_features
@@ -235,36 +239,52 @@ class GroupQLinear(nn.Module):
         self.weight = None
         self.codebook_width = codebook_width
         self._decoded_weight_cache = {}
+        self._weight_quant_runtime_cache = {}
 
         self.fake_quant = fake_quant
         self.skip_output_quant = False
+        self.weight_quant = weight_quant
 
         self.register_buffer(
-            "weight_indices",
-            torch.zeros(
-                self.n_groups,
-                self.out_features,
-                dtype=torch.uint8,
-                requires_grad=False,
-            ),
-        )
-        self.register_buffer(
-            "weight_codebook",
-            torch.zeros(
-                2 ** self.codebook_width,
-                self.in_features,
-                dtype=torch.bfloat16,
-                requires_grad=False,
-            ),
-        )
-        # self.register_buffer(
-        #     "weight_scales",
-        #     torch.randn(
-        #         self.out_features,
-        #         dtype=torch.bfloat16,
-        #         requires_grad=False,
-        #     ),
-        # )
+                "weight_indices",
+                torch.zeros(
+                    self.n_groups,
+                    self.out_features,
+                    dtype=torch.uint8,
+                    requires_grad=False,
+                ),
+            )
+        
+        if weight_quant:
+            self.register_buffer(
+                "weight_scales",
+                torch.randn(
+                    self.out_features,
+                    dtype=torch.bfloat16,
+                    requires_grad=False,
+                ),
+            )
+            
+            self.register_buffer(
+                "weight_codebook",
+                torch.zeros(
+                    2 ** self.codebook_width,
+                    self.in_features,
+                    dtype=torch.int8,
+                    requires_grad=False,
+                ),
+            )
+        else:
+            self.register_buffer(
+                "weight_codebook",
+                torch.zeros(
+                    2 ** self.codebook_width,
+                    self.in_features,
+                    dtype=torch.bfloat16,
+                    requires_grad=False,
+                ),
+            )
+            
         if bias:
             self.register_buffer(
                 "bias",
@@ -277,6 +297,7 @@ class GroupQLinear(nn.Module):
 
     def to(self, *args, **kwargs):
         self._decoded_weight_cache = {}
+        self._weight_quant_runtime_cache = {}
         super(GroupQLinear, self).to(*args, **kwargs)
         return self
 
@@ -286,7 +307,7 @@ class GroupQLinear(nn.Module):
             return self.weight.to(device=device, dtype=torch.bfloat16)
 
         device = torch.device(device)
-        cache_key = str(device)
+        cache_key = f"{device}:bf16"
         cached = self._decoded_weight_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -297,47 +318,67 @@ class GroupQLinear(nn.Module):
                 "Build/install the VectorQuant extension or disable VQ weight quantization."
             )
 
-        weight_q = torch.zeros(
-            (self.out_features, self.in_features),
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        VectorQuant.dequant_forward(
-            self.weight_indices.to(device),
-            self.weight_codebook.to(device),
-            weight_q,
-        )
-        self._decoded_weight_cache[cache_key] = weight_q
-        return weight_q
+        if self.weight_quant:
+            int8_cache_key = f"{device}:int8"
+            weight_q = self._decoded_weight_cache.get(int8_cache_key)
+            if weight_q is None:
+                weight_q = torch.zeros(
+                    (self.out_features, self.in_features),
+                    dtype=torch.int8,
+                    device=device,
+                )
+                VectorQuant.dequant_forward(
+                    self.weight_indices.to(device),
+                    self.weight_codebook.to(device),
+                    weight_q,
+                )
+                self._decoded_weight_cache[int8_cache_key] = weight_q
+            weight_float_q = dequantize_weight_per_channel_absmax(
+                weight_q, self.weight_scales.to(device=device, dtype=torch.bfloat16)
+            )
+            self._decoded_weight_cache[cache_key] = weight_float_q
+            
+            return weight_float_q
+        else:
+            weight_q = torch.zeros(
+                (self.out_features, self.in_features),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            
+            VectorQuant.dequant_forward(
+                self.weight_indices.to(device),
+                self.weight_codebook.to(device),
+                weight_q,
+            )
+            self._decoded_weight_cache[cache_key] = weight_q
+            
+            return weight_q
 
 
     @torch.no_grad()
     def forward(self, x, return_quant_tensor=True):
         if not self.fake_quant:
-            if isinstance(x, QuantTensor):
-                device = x.activation.device
-                x_source = x
+            if self.weight_quant:
+                x_quant = x if isinstance(x, QuantTensor) else QuantTensor(x)
+                # Activation quantization is per-token ([B, T, 1] scale), so use
+                # token-scale int8 path instead of per-group reduce-sum kernel.
+                y = weight_quant_int8_npu_forward(self, x_quant)
+                if y is None:
+                    y = weight_quant_int8_fallback_forward(self, x_quant)
             else:
-                device = x.device
-                x_source = x
-            weight_q = self._decode_weight_q(device)
-            x_dq = x_source.dequantize() if isinstance(x_source, QuantTensor) else x_source
-            # weight_dq = dequantize_weight_per_channel_absmax(self.weight, self.weight_scales)
-            bias = self.bias.squeeze(0) if self.bias is not None else None
-            y = torch.nn.functional.linear(x_dq, weight_q, bias)
+                if isinstance(x, QuantTensor):
+                    device = x.activation.device
+                    x_dq = x.dequantize()
+                else:
+                    device = x.device
+                    x_dq = x
+                weight_q = self._decode_weight_q(device)
+                # weight_dq = dequantize_weight_per_channel_absmax(self.weight, self.weight_scales)
+                bias = self.bias.squeeze(0) if self.bias is not None else None
+                y = torch.nn.functional.linear(x_dq, weight_q, bias)
+
             out = QuantTensor(y) if return_quant_tensor else y
-            # out = fused_quant_linear_vq_cached(
-            #     x,
-            #     out_features=self.out_features,
-            #     in_features=self.in_features,
-            #     bias=self.bias,
-            #     weight_indices=self.weight_indices,
-            #     weight_codebook=self.weight_codebook,
-            #     decoded_weight_cache=self._decoded_weight_cache,
-            #     cache_key=str(x.activation.device),
-            #     return_quant_tensor=return_quant_tensor,
-            #     quant_tensor_cls=QuantTensor if return_quant_tensor else None,
-            # )
             return out
         else:
             d_x = fake_quantize_activation_per_token(x)
@@ -368,18 +409,20 @@ class GroupQLinear(nn.Module):
             n_groups= n_groups,
             bias=module.bias is not None,
             fake_quant=args.fake_quant,
-            codebook_width=args.codebook_width
+            codebook_width=args.codebook_width,
+            weight_quant=args.weight_quant
         )
         if not args.eval_only:
-            # weight_q, weight_scales = quantize_weight_per_channel_absmax(
-            #     module.weight.detach().float()
-            # )
-            # new_module.weight_scales.copy_(
-            #     weight_scales.squeeze(-1).to(
-            #         device=new_module.weight_scales.device,
-            #         dtype=new_module.weight_scales.dtype,
-            #     )
-            # )
+            if args.weight_quant:
+                _, weight_scales = quantize_weight_per_channel_absmax(
+                    module.weight.detach().float()
+                )
+                new_module.weight_scales.copy_(
+                    weight_scales.squeeze(-1).to(
+                        device=new_module.weight_scales.device,
+                        dtype=new_module.weight_scales.dtype,
+                    )
+                )
 
             smoothvq = SmoothVQ(module)
             smoothvq.quantizer = QClass()

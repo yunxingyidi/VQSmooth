@@ -155,10 +155,15 @@ def llama_sequential(model, dataloader, dev, args):
     return quantizers
 
 @torch.no_grad()
-def llama_eval(model, testenc, dev):
+def llama_eval(model, testenc, dev, profile=False):
 
     testenc = testenc.input_ids
     nsamples = testenc.numel() // model.seqlen
+    profile_times = {
+        "capture_s": 0.0,
+        "decoder_layers_s": 0.0,
+        "head_loss_s": 0.0,
+    }
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -184,6 +189,7 @@ def llama_eval(model, testenc, dev):
             cache["position_embeddings"] = kwargs.get("position_embeddings")
             raise ValueError
 
+    t_capture_0 = time.perf_counter() if profile else 0.0
     layers[0] = Catcher(layers[0])
     for i in range(nsamples):
         batch = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)].to(dev)
@@ -192,6 +198,8 @@ def llama_eval(model, testenc, dev):
         except ValueError:
             pass
     layers[0] = layers[0].module
+    if profile:
+        profile_times["capture_s"] += time.perf_counter() - t_capture_0
 
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()
@@ -205,6 +213,7 @@ def llama_eval(model, testenc, dev):
     final_layer = len(layers) - 1
     print(f"final layer: {final_layer}")
     layer_indices = range(final_layer + 1)
+    t_layers_0 = time.perf_counter() if profile else 0.0
     for i in layer_indices:
         print(i)
         layer = layers[i].to(dev)
@@ -219,6 +228,8 @@ def llama_eval(model, testenc, dev):
         del layer
         torch.cuda.empty_cache()
         inps, outs = outs, inps
+    if profile:
+        profile_times["decoder_layers_s"] += time.perf_counter() - t_layers_0
 
     if model.model.norm is not None:
         model.model.norm = model.model.norm.to(dev)
@@ -226,6 +237,7 @@ def llama_eval(model, testenc, dev):
 
     testenc = testenc.to(dev)
     nlls = []
+    t_head_0 = time.perf_counter() if profile else 0.0
     for i in range(nsamples):
         hidden_states = inps[i].unsqueeze(0)
         if model.model.norm is not None:
@@ -237,10 +249,19 @@ def llama_eval(model, testenc, dev):
         loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         neg_log_likelihood = loss.float() * model.seqlen
         nlls.append(neg_log_likelihood)
+    if profile:
+        profile_times["head_loss_s"] += time.perf_counter() - t_head_0
     ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
 
     with open("ppl_log.txt", "a") as f:
         f.write(f"{ppl.item()}\n")
 
     print(ppl.item())
+    if profile:
+        total = profile_times["capture_s"] + profile_times["decoder_layers_s"] + profile_times["head_loss_s"]
+        print("[Eval Profile] ----")
+        print(f"[Eval Profile] capture_s={profile_times['capture_s']:.6f}")
+        print(f"[Eval Profile] decoder_layers_s={profile_times['decoder_layers_s']:.6f}")
+        print(f"[Eval Profile] head_loss_s={profile_times['head_loss_s']:.6f}")
+        print(f"[Eval Profile] total_profiled_s={total:.6f}")
     model.config.use_cache = use_cache
